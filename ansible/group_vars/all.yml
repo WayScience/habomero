@@ -1,0 +1,7 @@
+omero_project_root: "{{ lookup('env', 'PWD') }}"
+omero_data_dirs:
+  - data/postgres
+  - data/omero
+  - data/backups
+  - data/omero-web-var
+omero_use_docker_role: false

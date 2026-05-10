@@ -1,0 +1,16 @@
+---
+- name: Install Docker prerequisites (Linux only)
+  ansible.builtin.package:
+    name:
+      - ca-certificates
+      - curl
+    state: present
+  become: true
+  when: ansible_system == 'Linux'
+
+- name: Explain macOS behavior
+  ansible.builtin.debug:
+    msg: >-
+      Docker provisioning role is intentionally no-op on macOS.
+      Install Docker Desktop manually and keep omero_use_docker_role=false.
+  when: ansible_system == 'Darwin'

@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16
+    container_name: omero-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  omero-server:
+    image: openmicroscopy/omero-server:${OMERO_SERVER_TAG}
+    container_name: omero-server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ROOTPASS: ${OMERO_ROOT_PASSWORD}
+      CONFIG_omero_db_host: db
+      CONFIG_omero_db_user: ${POSTGRES_USER}
+      CONFIG_omero_db_pass: ${POSTGRES_PASSWORD}
+      CONFIG_omero_db_name: ${POSTGRES_DB}
+      CONFIG_omero_db_port: "5432"
+    ports:
+      - "4063:4063"
+      - "4064:4064"
+    volumes:
+      - ./data/omero:/OMERO
+      - ${OMERO_SCAN_DIR}:/scan/inbox:ro
+
+  omero-web:
+    image: openmicroscopy/omero-web-standalone:${OMERO_WEB_TAG}
+    container_name: omero-web
+    restart: unless-stopped
+    depends_on:
+      - omero-server
+    environment:
+      OMEROHOST: omero-server
+      CONFIG_omero_web_debug: "false"
+    ports:
+      - "${OMERO_WEB_PORT}:4080"
+    volumes:
+      - ./data/omero-web-var:/opt/omero/web/OMERO.web/var

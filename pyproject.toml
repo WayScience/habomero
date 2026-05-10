@@ -1,0 +1,116 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=64" ]
+
+[project]
+name = "habomero"
+version = "0.0.1"
+description = "Reproducible server-style OMERO deployment for local development using Docker Compose, Ansible, and uv."
+readme = "README.md"
+authors = [ { name = "Dave Bunten" } ]
+requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [ "pyyaml>=6.0.2" ]
+
+[dependency-groups]
+dev = [
+  "poethepoet>=0.34",
+  "pre-commit>=4.2",
+  "pytest>=8.3.5",
+]
+docs = [
+  "myst-nb>=1.2",
+  "pydata-sphinx-theme>=0.16.1",
+  "sphinx>=8.2.3",
+]
+
+[tool.setuptools]
+py-modules = [  ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+fix = true
+lint.select = [
+  "A",
+  "ANN",
+  "C4",
+  "C90",
+  "E",
+  "F",
+  "I",
+  "PL",
+  "RUF",
+  "SIM",
+  "W",
+]
+lint.per-file-ignores."__init__.py" = [ "F401" ]
+
+[tool.uv]
+default-groups = [ "dev" ]
+
+[tool.poe.tasks]
+run.sequence = [
+  "scan-dirs",
+  "provision",
+  "up",
+  "sync-users",
+  "import-scan",
+  "healthcheck",
+]
+provision.shell = """
+python scripts/project_guard.py
+ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
+"""
+up.shell = """
+python scripts/project_guard.py
+docker compose up -d
+python scripts/show_access_url.py
+"""
+down.shell = """
+python scripts/project_guard.py
+docker compose down
+"""
+logs.shell = """
+python scripts/project_guard.py
+docker compose logs -f --tail=150
+"""
+backup.shell = """
+python scripts/project_guard.py
+python scripts/backup.py
+"""
+restore.shell = """
+python scripts/project_guard.py
+python scripts/restore.py ${BACKUP_FILE}
+"""
+healthcheck.shell = """
+python scripts/project_guard.py
+python scripts/healthcheck.py
+"""
+sync-users.shell = """
+python scripts/project_guard.py
+python scripts/sync_users.py
+"""
+import-scan.shell = """
+python scripts/project_guard.py
+python scripts/import_scan.py
+"""
+scan-dirs.shell = """
+python scripts/project_guard.py
+python scripts/scan_dirs.py
+"""
+validate.shell = """
+python scripts/project_guard.py
+python scripts/validate.py
+python scripts/scan_dirs.py
+ansible-playbook -i ansible/inventory.ini ansible/playbook.yml --syntax-check
+"""
+
+[tool.vulture]
+min_confidence = 90
+paths = [ "scripts" ]

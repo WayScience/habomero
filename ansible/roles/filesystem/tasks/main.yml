@@ -1,0 +1,7 @@
+---
+- name: Create runtime directories
+  ansible.builtin.file:
+    path: "{{ omero_project_root }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ omero_data_dirs + (scan_directories | default([])) }}"
