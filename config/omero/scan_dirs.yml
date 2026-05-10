@@ -1,0 +1,15 @@
+allow_external_paths: true
+scan_directories:
+  - ~/Downloads/archive
+
+# Optional ownership routing by path under /scan/inbox.
+# Longest prefix match wins.
+# Example:
+# path_user_routes:
+#   - prefix: team_a
+#     username: alice
+#   - prefix: team_b/project_x
+#     username: bob
+path_user_routes:
+  - prefix: Input3DNuclei
+    username: test

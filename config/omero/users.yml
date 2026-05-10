@@ -1,0 +1,8 @@
+users:
+  - username: test
+    first_name: Test
+    last_name: User
+    group: lab
+    email: test@example.org
+    institution: Local Lab
+    password: test
