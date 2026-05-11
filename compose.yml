@@ -34,7 +34,6 @@ services:
       - "4064:4064"
     volumes:
       - ./data/omero:/OMERO
-      - ${OMERO_SCAN_DIR}:/scan/inbox:ro
 
   omero-web:
     image: openmicroscopy/omero-web-standalone:${OMERO_WEB_TAG}

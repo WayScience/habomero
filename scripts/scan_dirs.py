@@ -1,17 +1,20 @@
-"""Validate and materialize configured OMERO scan directories."""
+"""Validate scan directories and materialize multi-root mounts for OMERO."""
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
+STATE_PATH = PROJECT_ROOT / "data/state/scan_roots.yml"
+COMPOSE_OVERRIDE_PATH = PROJECT_ROOT / "data/state/scan_roots.compose.yml"
 
 
 def load_scan_directories() -> list[Path]:
-    """Load configured scan directories as project-relative paths."""
+    """Load configured scan directories as resolved absolute paths."""
 
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Scan directory config is missing: {CONFIG_PATH}")
@@ -28,36 +31,62 @@ def load_scan_directories() -> list[Path]:
             raise ValueError("scan_directories entries must be non-empty strings")
 
         entry_path = Path(item).expanduser()
-        if entry_path.is_absolute():
-            target = entry_path.resolve()
-        else:
-            target = (PROJECT_ROOT / entry_path).resolve()
+        target = (
+            entry_path.resolve()
+            if entry_path.is_absolute()
+            else (PROJECT_ROOT / entry_path).resolve()
+        )
 
         if not allow_external and PROJECT_ROOT not in [target, *target.parents]:
             raise ValueError(f"Path escapes project root: {item}")
+        if not target.exists() or not target.is_dir():
+            raise FileNotFoundError(f"Scan directory does not exist: {target}")
 
         resolved.append(target)
 
     return resolved
 
 
-def ensure_directories(paths: list[Path]) -> None:
-    """Create configured directories when they do not already exist."""
+def root_key(path: Path) -> str:
+    """Generate a stable short key for a source root path."""
 
-    for path in paths:
-        path.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:10]
+    return f"root_{digest}"
+
+
+def materialize_scan_roots(paths: list[Path]) -> dict[str, dict[str, str]]:
+    """Build a root mapping and compose override for direct bind mounts."""
+
+    mapping: dict[str, dict[str, str]] = {}
+    volumes: list[str] = []
+
+    for source in paths:
+        key = root_key(source)
+        container_root = f"/scan/roots/{key}"
+
+        mapping[key] = {
+            "source": str(source),
+            "container_root": container_root,
+        }
+        volumes.append(f"{source}:{container_root}:ro")
+
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(yaml.safe_dump(mapping, sort_keys=True), encoding="utf-8")
+    override = {"services": {"omero-server": {"volumes": volumes}}}
+    COMPOSE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    COMPOSE_OVERRIDE_PATH.write_text(
+        yaml.safe_dump(override, sort_keys=True), encoding="utf-8"
+    )
+    return mapping
 
 
 def main() -> None:
-    """Load, validate, and create scan directories."""
+    """Load, validate, and materialize scan roots for container mounts."""
 
     directories = load_scan_directories()
-    ensure_directories(directories)
-    for path in directories:
-        if PROJECT_ROOT in [path, *path.parents]:
-            print(path.relative_to(PROJECT_ROOT))
-        else:
-            print(path)
+    mapping = materialize_scan_roots(directories)
+    for key, data in sorted(mapping.items()):
+        print(f"{key}: {data['source']}")
 
 
 if __name__ == "__main__":
