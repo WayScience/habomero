@@ -12,6 +12,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config/omero/users.yml"
+SCAN_CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
 ENV_PATH = PROJECT_ROOT / ".env"
 
 
@@ -227,14 +228,44 @@ def load_users() -> list[dict[str, str]]:  # noqa: C901
     return normalized
 
 
+def load_shared_group() -> str | None:
+    """Load optional shared group name for all users."""
+
+    if not SCAN_CONFIG_PATH.exists():
+        return None
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    group = payload.get("shared_group")
+    if group is None:
+        return None
+    if not isinstance(group, str) or not group.strip():
+        raise UserConfigError("shared_group must be a non-empty string when provided")
+    if group.strip() in RESERVED_GROUPS:
+        raise UserConfigError(
+            "shared_group must be a non-reserved data group "
+            "(not one of: user, guest, system)"
+        )
+    return group.strip()
+
+
 def main() -> None:
     """Load user config and sync each entry into OMERO."""
 
     root_password = read_env_var("OMERO_ROOT_PASSWORD")
     wait_for_server(root_password)
     users = load_users()
+    shared_group = load_shared_group()
     for user in users:
         ensure_user(root_password, user)
+        if shared_group and user["group"] != shared_group:
+            ensure_group(root_password, shared_group)
+            join_result = run_in_omero(
+                root_password,
+                f"omero user joingroup {shared_group} --name={user['username']}",
+            )
+            if join_result.returncode == 0:
+                print(f"group-ok: {user['username']} -> {shared_group}")
+            elif "already" in join_result.stderr.lower():
+                print(f"group-exists: {user['username']} -> {shared_group}")
 
 
 if __name__ == "__main__":

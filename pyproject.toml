@@ -63,22 +63,39 @@ run.sequence = [
   "import-scan",
   "healthcheck",
 ]
+remote-run.sequence = [
+  "scan-dirs",
+  "up",
+  "sync-users",
+  "healthcheck",
+  "import-remote-safe",
+  "show-url",
+]
 provision.shell = """
 python scripts/project_guard.py
 ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
 """
 up.shell = """
 python scripts/project_guard.py
-docker compose up -d
+python scripts/scan_dirs.py
+docker compose -f compose.yml -f data/state/scan_roots.compose.yml up -d
 python scripts/show_access_url.py
 """
 down.shell = """
 python scripts/project_guard.py
-docker compose down
+if [ -f data/state/scan_roots.compose.yml ]; then
+  docker compose -f compose.yml -f data/state/scan_roots.compose.yml down
+else
+  docker compose -f compose.yml down
+fi
 """
 logs.shell = """
 python scripts/project_guard.py
-docker compose logs -f --tail=150
+if [ -f data/state/scan_roots.compose.yml ]; then
+  docker compose -f compose.yml -f data/state/scan_roots.compose.yml logs -f --tail=150
+else
+  docker compose -f compose.yml logs -f --tail=150
+fi
 """
 backup.shell = """
 python scripts/project_guard.py
@@ -99,6 +116,14 @@ python scripts/sync_users.py
 import-scan.shell = """
 python scripts/project_guard.py
 python scripts/import_scan.py
+"""
+import-remote-safe.shell = """
+python scripts/project_guard.py
+python scripts/import_remote_safe.py
+"""
+show-url.shell = """
+python scripts/project_guard.py
+python scripts/show_access_url.py
 """
 scan-dirs.shell = """
 python scripts/project_guard.py

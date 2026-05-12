@@ -14,35 +14,15 @@ Reproducible OMERO local-server deployment for development and pre-production te
 
 ```mermaid
 flowchart TD
-    A[Operator] --> B[uv run poe run]
+    A[You run uv run poe run] --> B[Prepare local folders]
+    B --> C[Start OMERO services]
+    C --> D[Sync users and import images]
+    D --> E[Quick health check]
+    E --> F[Open OMERO.web]
 
-    B --> C[scan-dirs]
-    C --> C1[config/omero/scan_dirs.yml]
-    C --> C2[Create/validate scan paths]
-
-    B --> D[provision]
-    D --> D1[Ansible playbook]
-    D1 --> D2[data/postgres]
-    D1 --> D3[data/omero]
-    D1 --> D4[data/backups]
-    D1 --> D5[data/omero-web-var]
-
-    B --> E[up]
-    E --> F[(Postgres)]
-    E --> G[OMERO.server]
-    E --> H[OMERO.web]
-    F --> G
-    G --> H
-
-    B --> I[sync-users]
-    I --> I1[config/omero/users.yml]
-    I --> G
-
-    B --> J[healthcheck]
-    J --> K[Service state output]
-
-    L[Browser :4080/webclient] --> H
-    M[OMERO scan mount] --> G
+    G[scan_dirs.yml + users.yml] --> D
+    H[Source image directories] --> D
+    I[Browser at /webclient] --> F
 ```
 
 ## Quick start (macOS and Linux)
@@ -113,9 +93,12 @@ uv run poe run
 `poe run` now also auto-imports new `.tif`/`.tiff` files from the mounted
 scan directory (`OMERO_SCAN_DIR` -> `/scan/inbox`) using the first user in
 `config/omero/users.yml`.
-You can route ownership by directory prefix using `path_user_routes` in
-`config/omero/scan_dirs.yml`; each directory bucket is imported into a
-dedicated Dataset automatically.
+Imports mirror directory hierarchy in OMERO Folders (folders map to folders,
+images map to images). If `shared_group` is set in `config/omero/scan_dirs.yml`,
+all configured users are joined to that group and imported content is visible
+to all group members. Set `import_mode: inplace` in
+`config/omero/scan_dirs.yml` to avoid duplicate storage by importing file
+references instead of copying pixel data.
 
 - Sync allowlisted OMERO users:
 

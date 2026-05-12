@@ -1,15 +1,31 @@
 allow_external_paths: true
 scan_directories:
-  - ~/Downloads/archive
+  - ~/mnt/bandicoot/NF1_organoid_data/data/NF0014_T1/zstack_images/G9-2
 
-# Optional ownership routing by path under /scan/inbox.
-# Longest prefix match wins.
-# Example:
-# path_user_routes:
-#   - prefix: team_a
-#     username: alice
-#   - prefix: team_b/project_x
-#     username: bob
-path_user_routes:
-  - prefix: Input3DNuclei
-    username: test
+# Optional shared OMERO group for imports. All configured users are joined
+# to this group by sync-users, and imports use this group context.
+shared_group: lab
+
+# Optional root folder name in OMERO for mirrored filesystem hierarchy.
+omero_folder_root: scan-root
+
+# Import behavior:
+# - copy: duplicate image data into OMERO managed storage
+# - inplace: keep data at source path and import by reference (no duplication)
+import_mode: inplace
+
+# Safety controls for high-latency/remote sources:
+# Maximum number of files to attempt in a single import-scan run.
+max_files_per_run: 25
+# Require DB to report healthy N consecutive checks before imports begin.
+db_stable_checks_required: 5
+db_stable_check_interval_seconds: 3
+# Stop a run after this many per-file failures.
+max_failures_per_run: 25
+# Pause between individual file imports inside a run.
+sleep_between_imports_seconds: 2
+
+# Remote-safe round runner (`uv run poe import-remote-safe`)
+safe_import_rounds: 30
+safe_import_pause_seconds: 20
+safe_import_stagnant_rounds: 3
