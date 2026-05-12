@@ -1,4 +1,11 @@
 users:
+  - username: habomero
+    first_name: Habomero
+    last_name: Service
+    group: lab
+    email: habomero@example.org
+    institution: Local Lab
+    password: habomero
   - username: test
     first_name: Test
     last_name: User

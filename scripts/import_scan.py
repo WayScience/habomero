@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import yaml
@@ -38,6 +40,9 @@ DB_STABLE_CHECKS_REQUIRED = 5
 DB_STABLE_CHECK_INTERVAL_SECONDS = 3
 LIST_RETRY_ATTEMPTS = 5
 LIST_RETRY_BACKOFF_SECONDS = 3
+SCAN_PROGRESS_EVERY_PATHS = 100_000
+IMPORT_PROGRESS_EVERY_FILES = 50
+IMPORT_WORKERS = 1
 
 
 class ImportConfigError(ValueError):
@@ -101,7 +106,8 @@ def load_user_credentials() -> tuple[dict[str, str], str]:
     return credentials, first_username
 
 
-def load_import_config() -> tuple[str, str, str, int, int, int, int, int]:
+def load_import_config(  # noqa: C901, PLR0912, PLR0915
+) -> tuple[str, str, str, int, int, int, int, int, int, int, int]:
     shared_group = ""
     root_prefix = "scan-root"
     import_mode = "copy"
@@ -110,6 +116,9 @@ def load_import_config() -> tuple[str, str, str, int, int, int, int, int]:
     db_stable_interval = DB_STABLE_CHECK_INTERVAL_SECONDS
     max_failures_per_run = MAX_FAILURES_PER_RUN
     sleep_between_files = SLEEP_BETWEEN_IMPORTS_SECONDS
+    scan_progress_every_paths = SCAN_PROGRESS_EVERY_PATHS
+    import_progress_every_files = IMPORT_PROGRESS_EVERY_FILES
+    import_workers = IMPORT_WORKERS
     if SCAN_CONFIG_PATH.exists():
         payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
         group = payload.get("shared_group")
@@ -146,6 +155,75 @@ def load_import_config() -> tuple[str, str, str, int, int, int, int, int]:
             "sleep_between_imports_seconds",
             sleep_between_files,
         )
+        scan_progress_every_paths = positive_int(
+            payload, "scan_progress_every_paths", scan_progress_every_paths
+        )
+        import_progress_every_files = positive_int(
+            payload,
+            "import_progress_every_files",
+            import_progress_every_files,
+        )
+        import_workers = positive_int(payload, "import_workers", import_workers)
+    env_cap = os.environ.get("IMPORT_MAX_FILES_PER_RUN", "").strip()
+    if env_cap:
+        try:
+            parsed = int(env_cap)
+        except ValueError as exc:
+            raise ImportConfigError(
+                "IMPORT_MAX_FILES_PER_RUN must be a positive integer"
+            ) from exc
+        if parsed <= 0:
+            raise ImportConfigError(
+                "IMPORT_MAX_FILES_PER_RUN must be a positive integer"
+            )
+        max_files_per_run = parsed
+    env_sleep = os.environ.get("IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS", "").strip()
+    if env_sleep:
+        try:
+            parsed_sleep = int(env_sleep)
+        except ValueError as exc:
+            raise ImportConfigError(
+                "IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS must be a non-negative integer"
+            ) from exc
+        if parsed_sleep < 0:
+            raise ImportConfigError(
+                "IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS must be a non-negative integer"
+            )
+        sleep_between_files = parsed_sleep
+    env_scan_log = os.environ.get("IMPORT_SCAN_PROGRESS_EVERY_PATHS", "").strip()
+    if env_scan_log:
+        try:
+            scan_progress_every_paths = int(env_scan_log)
+        except ValueError as exc:
+            raise ImportConfigError(
+                "IMPORT_SCAN_PROGRESS_EVERY_PATHS must be a positive integer"
+            ) from exc
+        if scan_progress_every_paths <= 0:
+            raise ImportConfigError(
+                "IMPORT_SCAN_PROGRESS_EVERY_PATHS must be a positive integer"
+            )
+    env_import_log = os.environ.get("IMPORT_PROGRESS_EVERY_FILES", "").strip()
+    if env_import_log:
+        try:
+            import_progress_every_files = int(env_import_log)
+        except ValueError as exc:
+            raise ImportConfigError(
+                "IMPORT_PROGRESS_EVERY_FILES must be a positive integer"
+            ) from exc
+        if import_progress_every_files <= 0:
+            raise ImportConfigError(
+                "IMPORT_PROGRESS_EVERY_FILES must be a positive integer"
+            )
+    env_workers = os.environ.get("IMPORT_WORKERS", "").strip()
+    if env_workers:
+        try:
+            import_workers = int(env_workers)
+        except ValueError as exc:
+            raise ImportConfigError(
+                "IMPORT_WORKERS must be a positive integer"
+            ) from exc
+        if import_workers <= 0:
+            raise ImportConfigError("IMPORT_WORKERS must be a positive integer")
     return (
         shared_group,
         root_prefix,
@@ -155,6 +233,9 @@ def load_import_config() -> tuple[str, str, str, int, int, int, int, int]:
         db_stable_interval,
         max_failures_per_run,
         sleep_between_files,
+        scan_progress_every_paths,
+        import_progress_every_files,
+        import_workers,
     )
 
 
@@ -318,7 +399,12 @@ def extract_object_id(output: str, object_name: str) -> int:
     return int(match.group(1))
 
 
-def list_root_files(source_root: str, container_root: str) -> list[str]:
+def list_root_files(
+    source_root: str,
+    container_root: str,
+    max_files: int | None = None,
+    scan_progress_every_paths: int = SCAN_PROGRESS_EVERY_PATHS,
+) -> list[str]:
     """List files from host source path, mapped to container-root paths."""
 
     source_path = Path(source_root)
@@ -328,21 +414,45 @@ def list_root_files(source_root: str, container_root: str) -> list[str]:
     print(f"[scan] source_root={source_root}")
     print(f"[scan] container_root={container_root}")
     print(f"[scan] indexing files under {source_root}")
+
+    # Streaming `find` is substantially faster than Python-level rglob on huge trees.
+    process = subprocess.Popen(
+        ["find", source_root, "-type", "f"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+
     files: list[str] = []
     scanned = 0
-    for path in source_path.rglob("*"):
-        scanned += 1
-        if scanned % 100 == 0:
-            print(f"[scan] visited={scanned} matched={len(files)}")
-        if not path.is_file():
-            continue
-        lowered = path.name.lower()
-        if not any(lowered.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
-            continue
-        rel = path.relative_to(source_path).as_posix()
-        files.append(f"{container_root.rstrip('/')}/{rel}")
+    src_prefix = source_root.rstrip("/") + "/"
+    try:
+        for line in process.stdout:
+            scanned += 1
+            if scanned % scan_progress_every_paths == 0:
+                print(f"[scan] visited={scanned} matched={len(files)}")
+            abs_path = line.strip()
+            if not abs_path:
+                continue
+            lowered = abs_path.lower()
+            if not any(lowered.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+                continue
+            rel = abs_path.removeprefix(src_prefix)
+            files.append(f"{container_root.rstrip('/')}/{rel}")
+            if max_files is not None and len(files) >= max_files:
+                print(
+                    f"[scan] reached max candidate cap={max_files}, stopping scan early"
+                )
+                process.terminate()
+                break
+    finally:
+        _stdout, stderr = process.communicate(timeout=15)
+        if process.returncode not in (0, -15) and stderr.strip():
+            raise RuntimeError(f"Host file scan failed: {stderr.strip()}")
+
     print(f"[scan] completed visited={scanned} matched={len(files)}")
-    return sorted(files)
+    return files
 
 
 def rel_path_from_root(abs_path: str, container_root: str) -> str:
@@ -423,8 +533,22 @@ def get_or_create_dataset(  # noqa: PLR0913
         f"parent=Project:{project_id} child=Dataset:{dataset_id}",
         group,
     )
-    if link.returncode != 0 and "already" not in link.stderr.lower():
-        raise RuntimeError(f"Failed to link dataset: {link.stderr.strip()}")
+    if link.returncode != 0:
+        # Idempotency guard: tolerate link failures when link already exists.
+        existing = run_as_user_with_retry(
+            owner,
+            password,
+            "omero hql "
+            '"select count(l) from ProjectDatasetLink l '
+            f'where l.parent.id = {project_id} and l.child.id = {dataset_id}"',
+            group,
+        )
+        if (
+            existing.returncode == 0 and "(1 row)" in existing.stdout
+        ) or "already" in link.stderr.lower():
+            pass
+        else:
+            raise RuntimeError(f"Failed to link dataset: {link.stderr.strip()}")
 
     dataset_state[map_key] = dataset_id
     return dataset_id, True
@@ -451,11 +575,45 @@ def delete_dataset(  # noqa: PLR0913
         dataset_state.pop(f"{root_key}|{rel_dir}", None)
 
 
+def load_dataset_image_names(
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    dataset_id: int,
+) -> set[str]:
+    """Load existing image names for a dataset from OMERO."""
+
+    cmd = (
+        "omero hql "
+        f'"select i.name from Image i join i.datasetLinks l '
+        f'where l.parent.id = {dataset_id}"'
+    )
+    result = run_as_user_with_retry(owner, owner_password, cmd, shared_group)
+    if result.returncode != 0:
+        return set()
+
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text or text.startswith("Using session") or text.startswith("("):
+            continue
+        # HQL output is typically like: [my_image.tif]
+        cleaned = text.strip("[] ").strip()
+        if cleaned:
+            names.add(cleaned)
+    return names
+
+
 def build_import_command(import_mode: str, dataset_id: int, abs_path: str) -> str:
     """Build OMERO import command for configured transfer mode."""
 
     transfer_args = "--transfer=ln_s " if import_mode == "inplace" else ""
-    return f"omero import {transfer_args}-d {dataset_id} {shlex.quote(abs_path)}"
+    debug_level = os.environ.get("IMPORT_OMERO_DEBUG", "").strip()
+    debug_args = f"--debug {shlex.quote(debug_level)} " if debug_level else ""
+    return (
+        f"omero import {transfer_args}{debug_args}-d {dataset_id} "
+        f"{shlex.quote(abs_path)}"
+    )
 
 
 def import_one_file(  # noqa: PLR0913
@@ -514,7 +672,65 @@ def import_one_file(  # noqa: PLR0913
     return False, tracking_key, result.stderr.strip()
 
 
-def import_root_files(  # noqa: PLR0913, C901
+def import_to_dataset(  # noqa: PLR0913
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    import_mode: str,
+    root_key: str,
+    container_root: str,
+    dataset_id: int,
+    abs_path: str,
+) -> tuple[bool, str, str]:
+    """Import one file when dataset is already known."""
+
+    rel_path = rel_path_from_root(abs_path, container_root)
+    command = build_import_command(import_mode, dataset_id, abs_path)
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, PER_FILE_RETRY_ATTEMPTS + 1):
+        result = run_as_user_with_retry(owner, owner_password, command, shared_group)
+        if result.returncode == 0:
+            print(f"[import-done] [{root_key}] {rel_path} -> Dataset:{dataset_id}")
+            return True, f"{root_key}:{abs_path}", ""
+        if not is_transient_import_error(result.stderr):
+            break
+        print(
+            f"[retry {attempt}/{PER_FILE_RETRY_ATTEMPTS}] transient import "
+            f"failure for {rel_path}"
+        )
+        time.sleep(PER_FILE_RETRY_BACKOFF_SECONDS * attempt)
+    assert result is not None
+    return False, f"{root_key}:{abs_path}", result.stderr.strip()
+
+
+def summarize_import_error(error: str) -> str:
+    """Extract a useful one-line error summary for console logs."""
+
+    lines = [line.strip() for line in error.splitlines() if line.strip()]
+    if not lines:
+        return "unknown error"
+    priority_tokens = (
+        "caused by",
+        "exception",
+        "error:",
+        "permission denied",
+        "no such file",
+        "unsupported",
+        "cannot",
+    )
+    for line in lines:
+        lowered = line.lower()
+        if "report bugs at https://www.openmicroscopy.org/forums" in lowered:
+            continue
+        if any(token in lowered for token in priority_tokens):
+            return line
+    for line in lines:
+        if "report bugs at https://www.openmicroscopy.org/forums" not in line.lower():
+            return line
+    return lines[0]
+
+
+def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     owner: str,
     owner_password: str,
     shared_group: str,
@@ -528,15 +744,25 @@ def import_root_files(  # noqa: PLR0913, C901
     budget_remaining: int,
     max_failures_per_run: int,
     sleep_between_imports_seconds: int,
+    scan_progress_every_paths: int,
+    import_progress_every_files: int,
+    import_workers: int,
 ) -> tuple[int, dict[str, str], bool]:
     """Import files for a single root. Returns count, failures, hit_cap."""
 
     imported_count = 0
+    skipped_existing_count = 0
     failures: dict[str, str] = {}
+    dataset_image_cache: dict[int, set[str]] = {}
     root_files: list[str] | None = None
     for attempt in range(1, LIST_RETRY_ATTEMPTS + 1):
         try:
-            root_files = list_root_files(source_root, container_root)
+            root_files = list_root_files(
+                source_root,
+                container_root,
+                max_files=budget_remaining if budget_remaining > 0 else None,
+                scan_progress_every_paths=scan_progress_every_paths,
+            )
             break
         except RuntimeError as exc:
             print(
@@ -552,6 +778,8 @@ def import_root_files(  # noqa: PLR0913, C901
         f"budget={budget_remaining}"
     )
 
+    # Build worklist serially so dataset/project bookkeeping stays consistent.
+    work: list[tuple[str, int]] = []
     for abs_path in root_files:
         if imported_count >= budget_remaining:
             print(f"Reached max_files_per_run budget for this run ({budget_remaining})")
@@ -561,36 +789,107 @@ def import_root_files(  # noqa: PLR0913, C901
             print(f"[import-candidate] {abs_path}")
         if tracking_key in imported:
             continue
-        ok, tracked, error = import_one_file(
+        rel_path = rel_path_from_root(abs_path, container_root)
+        rel_dir = dataset_key_for_rel_path(rel_path)
+        dataset_id, _ = get_or_create_dataset(
             owner,
             owner_password,
             shared_group,
-            import_mode,
             root_key,
+            rel_dir,
             project_id,
-            container_root,
-            abs_path,
             dataset_state,
         )
-        if not ok:
-            failures[tracked] = error
-            rel_path = rel_path_from_root(abs_path, container_root)
-            last_line = error.splitlines()[-1] if error else "unknown error"
-            print(f"[failed] {rel_path}: {last_line}")
-            if len(failures) >= max_failures_per_run:
+        if dataset_id not in dataset_image_cache:
+            dataset_image_cache[dataset_id] = load_dataset_image_names(
+                owner,
+                owner_password,
+                shared_group,
+                dataset_id,
+            )
+        file_name = Path(abs_path).name
+        if file_name in dataset_image_cache[dataset_id]:
+            imported.add(tracking_key)
+            skipped_existing_count += 1
+            if skipped_existing_count % 25 == 0:
                 print(
-                    f"Reached failure cap ({max_failures_per_run}), stopping import run"
+                    f"[dedupe] skipped_existing={skipped_existing_count} "
+                    f"dataset={dataset_id}"
                 )
-                return imported_count, failures, True
             continue
+        work.append((abs_path, dataset_id))
 
-        imported.add(tracked)
-        imported_count += 1
-        if imported_count % 5 == 0:
-            print(f"[root-progress] imported={imported_count} for {source_root}")
-        time.sleep(sleep_between_imports_seconds)
-        if sleep_between_imports_seconds > 0:
-            print(f"[pace] slept {sleep_between_imports_seconds}s")
+    if import_workers <= 1:
+        for abs_path, dataset_id in work:
+            ok, tracked, error = import_to_dataset(
+                owner,
+                owner_password,
+                shared_group,
+                import_mode,
+                root_key,
+                container_root,
+                dataset_id,
+                abs_path,
+            )
+            if not ok:
+                failures[tracked] = error
+                rel_path = rel_path_from_root(abs_path, container_root)
+                print(f"[failed] {rel_path}: {summarize_import_error(error)}")
+                if len(failures) >= max_failures_per_run:
+                    print(
+                        f"Reached failure cap ({max_failures_per_run}), "
+                        "stopping import run"
+                    )
+                    return imported_count, failures, True
+                continue
+
+            imported.add(tracked)
+            imported_count += 1
+            dataset_image_cache.setdefault(dataset_id, set()).add(Path(abs_path).name)
+            if imported_count % import_progress_every_files == 0:
+                print(f"[root-progress] imported={imported_count} for {source_root}")
+            time.sleep(sleep_between_imports_seconds)
+            if sleep_between_imports_seconds > 0:
+                print(f"[pace] slept {sleep_between_imports_seconds}s")
+        return imported_count, failures, False
+
+    print(f"[parallel] enabled with import_workers={import_workers}")
+    with ThreadPoolExecutor(max_workers=import_workers) as pool:
+        futures = {
+            pool.submit(
+                import_to_dataset,
+                owner,
+                owner_password,
+                shared_group,
+                import_mode,
+                root_key,
+                container_root,
+                dataset_id,
+                abs_path,
+            ): (abs_path, dataset_id)
+            for abs_path, dataset_id in work
+        }
+        for future in as_completed(futures):
+            abs_path, dataset_id = futures[future]
+            ok, tracked, error = future.result()
+            if not ok:
+                failures[tracked] = error
+                rel_path = rel_path_from_root(abs_path, container_root)
+                print(f"[failed] {rel_path}: {summarize_import_error(error)}")
+                if len(failures) >= max_failures_per_run:
+                    print(
+                        f"Reached failure cap ({max_failures_per_run}), "
+                        "stopping import run"
+                    )
+                    return imported_count, failures, True
+                continue
+            imported.add(tracked)
+            imported_count += 1
+            dataset_image_cache.setdefault(dataset_id, set()).add(Path(abs_path).name)
+            if imported_count % import_progress_every_files == 0:
+                print(f"[root-progress] imported={imported_count} for {source_root}")
+    if skipped_existing_count > 0:
+        print(f"[dedupe] skipped {skipped_existing_count} existing image(s)")
     return imported_count, failures, False
 
 
@@ -606,6 +905,9 @@ def import_files() -> None:
         db_stable_interval,
         max_failures_per_run,
         sleep_between_imports_seconds,
+        scan_progress_every_paths,
+        import_progress_every_files,
+        import_workers,
     ) = load_import_config()
     wait_for_db_stable(db_stable_checks, db_stable_interval)
 
@@ -654,6 +956,9 @@ def import_files() -> None:
             max_files_per_run - imported_count,
             max_failures_per_run,
             sleep_between_imports_seconds,
+            scan_progress_every_paths,
+            import_progress_every_files,
+            import_workers,
         )
         imported_count += root_imported
         failures.update(root_failures)

@@ -71,6 +71,34 @@ remote-run.sequence = [
   "import-remote-safe",
   "show-url",
 ]
+remote-run-100.sequence = [
+  "scan-dirs",
+  "up",
+  "sync-users",
+  "healthcheck",
+  "import-scan-100-parallel",
+  "show-url",
+]
+remote-run-100-parallel.sequence = [
+  "scan-dirs",
+  "up",
+  "sync-users",
+  "healthcheck",
+  "import-scan-100-parallel",
+  "show-url",
+]
+reset-state.sequence = [
+  "down",
+  "wipe-state",
+]
+reset-and-up.sequence = [
+  "reset-state",
+  "scan-dirs",
+  "up",
+  "sync-users",
+  "healthcheck",
+  "show-url",
+]
 provision.shell = """
 python scripts/project_guard.py
 ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
@@ -88,6 +116,11 @@ if [ -f data/state/scan_roots.compose.yml ]; then
 else
   docker compose -f compose.yml down
 fi
+"""
+wipe-state.shell = """
+python scripts/project_guard.py
+rm -rf data/postgres data/omero data/omero-web-var data/state
+mkdir -p data/postgres data/omero data/omero-web-var data/state
 """
 logs.shell = """
 python scripts/project_guard.py
@@ -117,9 +150,19 @@ import-scan.shell = """
 python scripts/project_guard.py
 python scripts/import_scan.py
 """
+import-scan-100.shell = """
+python scripts/project_guard.py
+IMPORT_MAX_FILES_PER_RUN=100 IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS=0 IMPORT_SCAN_PROGRESS_EVERY_PATHS=50000 IMPORT_PROGRESS_EVERY_FILES=50 python scripts/import_scan.py
+"""
+import-scan-100-parallel.shell = """
+python scripts/project_guard.py
+IMPORT_MAX_FILES_PER_RUN=100 IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS=0 IMPORT_SCAN_PROGRESS_EVERY_PATHS=50000 IMPORT_PROGRESS_EVERY_FILES=50 IMPORT_WORKERS=${IMPORT_WORKERS:-2} python scripts/import_scan.py
+"""
 import-remote-safe.shell = """
 python scripts/project_guard.py
+python scripts/show_access_url.py
 python scripts/import_remote_safe.py
+python scripts/show_access_url.py
 """
 show-url.shell = """
 python scripts/project_guard.py

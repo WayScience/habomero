@@ -1,6 +1,7 @@
 allow_external_paths: true
 scan_directories:
-  - ~/mnt/bandicoot/NF1_organoid_data/data/NF0014_T1/zstack_images/G9-2
+  - ~/mnt/bandicoot/RxRx19a
+  - ~/mnt/bandicoot/CFReT_subtyping_data
 
 # Optional shared OMERO group for imports. All configured users are joined
 # to this group by sync-users, and imports use this group context.
@@ -18,8 +19,8 @@ import_mode: inplace
 # Maximum number of files to attempt in a single import-scan run.
 max_files_per_run: 25
 # Require DB to report healthy N consecutive checks before imports begin.
-db_stable_checks_required: 5
-db_stable_check_interval_seconds: 3
+db_stable_checks_required: 2
+db_stable_check_interval_seconds: 1
 # Stop a run after this many per-file failures.
 max_failures_per_run: 25
 # Pause between individual file imports inside a run.
