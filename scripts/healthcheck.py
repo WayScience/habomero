@@ -6,6 +6,44 @@ import json
 import subprocess
 
 
+def run_cmd(command: list[str]) -> bool:
+    """Return True when a command exits successfully."""
+
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def probe_server_health() -> str:
+    """Probe OMERO.server readiness via CLI inside container."""
+
+    ok = run_cmd(
+        [
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "omero-server",
+            "bash",
+            "-lc",
+            'export PATH="/opt/omero/server/venv3/bin:$PATH"; omero version >/dev/null',
+        ]
+    )
+    return "healthy" if ok else "unhealthy"
+
+
+def probe_web_health() -> str:
+    """Probe OMERO.web endpoint from host."""
+
+    ok = run_cmd(
+        [
+            "curl",
+            "-fsSI",
+            "http://localhost:4080/webclient/",
+        ]
+    )
+    return "healthy" if ok else "unhealthy"
+
+
 def get_compose_health() -> list[dict[str, str]]:
     """Collect service status from docker compose ps JSON output."""
 
@@ -22,7 +60,7 @@ def get_compose_health() -> list[dict[str, str]]:
     if isinstance(rows, dict):
         rows = [rows]
 
-    return [
+    rows_out = [
         {
             "service": row.get("Service", "unknown"),
             "state": row.get("State", "unknown"),
@@ -30,6 +68,13 @@ def get_compose_health() -> list[dict[str, str]]:
         }
         for row in rows
     ]
+    for row in rows_out:
+        health = row["health"].strip()
+        if row["service"] == "omero-server" and not health:
+            row["health"] = probe_server_health()
+        if row["service"] == "omero-web" and not health:
+            row["health"] = probe_web_health()
+    return rows_out
 
 
 if __name__ == "__main__":

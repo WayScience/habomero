@@ -1,6 +1,6 @@
 allow_external_paths: true
 scan_directories:
-  - ~/mnt/bandicoot/RxRx19a
+  - ~/mnt/bandicoot/NF1_organoid_data/data/NF0014_T1/zstack_images/G9-2
 
 # Optional shared OMERO group for imports. All configured users are joined
 # to this group by sync-users, and imports use this group context.

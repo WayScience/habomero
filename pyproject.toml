@@ -63,6 +63,14 @@ run.sequence = [
   "import-scan",
   "healthcheck",
 ]
+remote-run.sequence = [
+  "scan-dirs",
+  "up",
+  "sync-users",
+  "healthcheck",
+  "import-remote-safe",
+  "show-url",
+]
 provision.shell = """
 python scripts/project_guard.py
 ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
@@ -112,6 +120,10 @@ python scripts/import_scan.py
 import-remote-safe.shell = """
 python scripts/project_guard.py
 python scripts/import_remote_safe.py
+"""
+show-url.shell = """
+python scripts/project_guard.py
+python scripts/show_access_url.py
 """
 scan-dirs.shell = """
 python scripts/project_guard.py

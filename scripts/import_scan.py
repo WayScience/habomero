@@ -36,6 +36,8 @@ MAX_FAILURES_PER_RUN = 50
 MAX_FILES_PER_RUN = 200
 DB_STABLE_CHECKS_REQUIRED = 5
 DB_STABLE_CHECK_INTERVAL_SECONDS = 3
+LIST_RETRY_ATTEMPTS = 5
+LIST_RETRY_BACKOFF_SECONDS = 3
 
 
 class ImportConfigError(ValueError):
@@ -179,13 +181,23 @@ def wait_for_db_stable(required_checks: int, interval_seconds: int) -> None:
 
     consecutive = 0
     attempts = max(required_checks * 20, 40)
-    for _ in range(attempts):
+    print(
+        "[db-gate] waiting for stable DB: "
+        f"need {required_checks} consecutive healthy checks"
+    )
+    for attempt in range(1, attempts + 1):
         if is_db_healthy():
             consecutive += 1
+            print(f"[db-gate] healthy check {consecutive}/{required_checks}")
             if consecutive >= required_checks:
+                print("[db-gate] stable DB confirmed")
                 return
         else:
+            if consecutive > 0:
+                print("[db-gate] health streak reset")
             consecutive = 0
+            if attempt % 5 == 0:
+                print(f"[db-gate] waiting... attempt={attempt}/{attempts}")
         time.sleep(interval_seconds)
     raise RuntimeError("Database did not stay healthy long enough for safe import")
 
@@ -306,20 +318,30 @@ def extract_object_id(output: str, object_name: str) -> int:
     return int(match.group(1))
 
 
-def list_root_files(container_root: str) -> list[str]:
-    result = run_in_omero(f"find {shlex.quote(container_root)} -type f")
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed listing files for {container_root}: {result.stderr.strip()}"
-        )
+def list_root_files(source_root: str, container_root: str) -> list[str]:
+    """List files from host source path, mapped to container-root paths."""
+
+    source_path = Path(source_root)
+    if not source_path.exists() or not source_path.is_dir():
+        raise RuntimeError(f"Source root is not available on host: {source_root}")
+
+    print(f"[scan] source_root={source_root}")
+    print(f"[scan] container_root={container_root}")
+    print(f"[scan] indexing files under {source_root}")
     files: list[str] = []
-    for line in result.stdout.splitlines():
-        path = line.strip()
-        if not path:
+    scanned = 0
+    for path in source_path.rglob("*"):
+        scanned += 1
+        if scanned % 100 == 0:
+            print(f"[scan] visited={scanned} matched={len(files)}")
+        if not path.is_file():
             continue
-        lowered = path.lower()
-        if any(lowered.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
-            files.append(path)
+        lowered = path.name.lower()
+        if not any(lowered.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+            continue
+        rel = path.relative_to(source_path).as_posix()
+        files.append(f"{container_root.rstrip('/')}/{rel}")
+    print(f"[scan] completed visited={scanned} matched={len(files)}")
     return sorted(files)
 
 
@@ -353,7 +375,9 @@ def get_or_create_project(  # noqa: PLR0913
     project_state: dict[str, int],
 ) -> int:
     if key in project_state:
+        print(f"[project] reuse Project:{project_state[key]} for {source}")
         return project_state[key]
+    print(f"[project] creating project for root source: {source}")
     name = shlex.quote(build_project_name(root_prefix, source))
     created = run_as_user_with_retry(
         owner, password, f"omero obj new Project name={name}", group
@@ -378,8 +402,10 @@ def get_or_create_dataset(  # noqa: PLR0913
 ) -> tuple[int, bool]:
     map_key = f"{root_key}|{rel_dir}"
     if map_key in dataset_state:
+        print(f"[dataset] reuse Dataset:{dataset_state[map_key]} for {rel_dir}")
         return dataset_state[map_key], False
 
+    print(f"[dataset] creating dataset for {rel_dir}")
     name = shlex.quote(build_dataset_name(rel_dir))
     created = run_as_user_with_retry(
         owner, password, f"omero obj new Dataset name={name}", group
@@ -459,11 +485,12 @@ def import_one_file(  # noqa: PLR0913
     )
 
     command = build_import_command(import_mode, dataset_id, abs_path)
+    print(f"[import-start] {rel_path} -> Dataset:{dataset_id}")
     result: subprocess.CompletedProcess[str] | None = None
     for attempt in range(1, PER_FILE_RETRY_ATTEMPTS + 1):
         result = run_as_user_with_retry(owner, owner_password, command, shared_group)
         if result.returncode == 0:
-            print(f"[{root_key}] {rel_path} -> Dataset:{dataset_id}")
+            print(f"[import-done] [{root_key}] {rel_path} -> Dataset:{dataset_id}")
             return True, tracking_key, ""
         if not is_transient_import_error(result.stderr):
             break
@@ -487,12 +514,13 @@ def import_one_file(  # noqa: PLR0913
     return False, tracking_key, result.stderr.strip()
 
 
-def import_root_files(  # noqa: PLR0913
+def import_root_files(  # noqa: PLR0913, C901
     owner: str,
     owner_password: str,
     shared_group: str,
     import_mode: str,
     root_key: str,
+    source_root: str,
     container_root: str,
     project_id: int,
     imported: set[str],
@@ -505,11 +533,32 @@ def import_root_files(  # noqa: PLR0913
 
     imported_count = 0
     failures: dict[str, str] = {}
-    for abs_path in list_root_files(container_root):
+    root_files: list[str] | None = None
+    for attempt in range(1, LIST_RETRY_ATTEMPTS + 1):
+        try:
+            root_files = list_root_files(source_root, container_root)
+            break
+        except RuntimeError as exc:
+            print(
+                f"[retry {attempt}/{LIST_RETRY_ATTEMPTS}] transient list failure "
+                f"for {source_root}: {exc}"
+            )
+            time.sleep(LIST_RETRY_BACKOFF_SECONDS * attempt)
+    if root_files is None:
+        print(f"[root-list-failed] {source_root}")
+        return 0, {}, False
+    print(
+        f"[root] {source_root}: candidate files={len(root_files)} "
+        f"budget={budget_remaining}"
+    )
+
+    for abs_path in root_files:
         if imported_count >= budget_remaining:
             print(f"Reached max_files_per_run budget for this run ({budget_remaining})")
             return imported_count, failures, True
         tracking_key = f"{root_key}:{abs_path}"
+        if imported_count % 10 == 0:
+            print(f"[import-candidate] {abs_path}")
         if tracking_key in imported:
             continue
         ok, tracked, error = import_one_file(
@@ -537,7 +586,11 @@ def import_root_files(  # noqa: PLR0913
 
         imported.add(tracked)
         imported_count += 1
+        if imported_count % 5 == 0:
+            print(f"[root-progress] imported={imported_count} for {source_root}")
         time.sleep(sleep_between_imports_seconds)
+        if sleep_between_imports_seconds > 0:
+            print(f"[pace] slept {sleep_between_imports_seconds}s")
     return imported_count, failures, False
 
 
@@ -560,6 +613,7 @@ def import_files() -> None:
     if not roots:
         print("No scan roots configured")
         return
+    print(f"[import] loaded roots={len(roots)} mode={import_mode}")
 
     imported = load_string_set(IMPORT_STATE_PATH)
     dataset_state = load_int_map(DATASET_STATE_PATH)
@@ -570,6 +624,8 @@ def import_files() -> None:
     for root_key, root_data in sorted(roots.items()):
         source = root_data["source"]
         container_root = root_data["container_root"]
+        print(f"[root-begin] {root_key} source={source}")
+        print(f"[root-begin] {root_key} container_root={container_root}")
         try:
             project_id = get_or_create_project(
                 owner,
@@ -590,6 +646,7 @@ def import_files() -> None:
             shared_group,
             import_mode,
             root_key,
+            source,
             container_root,
             project_id,
             imported,
@@ -600,6 +657,10 @@ def import_files() -> None:
         )
         imported_count += root_imported
         failures.update(root_failures)
+        print(
+            f"[root-end] {root_key} imported_this_root={root_imported} "
+            f"failures_this_root={len(root_failures)}"
+        )
         if hit_cap:
             break
 
