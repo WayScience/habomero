@@ -55,12 +55,14 @@ def run_healthcheck() -> None:
     print(result.stdout.strip())
 
 
-def run_import_once() -> tuple[bool, bool]:
+def run_import_once() -> tuple[bool, bool]:  # noqa: C901
     """Run import scan once and return (saw_import_summary, had_new_imports)."""
 
     roots = "unknown"
     if SCAN_ROOTS_STATE_PATH.exists():
-        payload = yaml.safe_load(SCAN_ROOTS_STATE_PATH.read_text(encoding="utf-8")) or {}
+        payload = (
+            yaml.safe_load(SCAN_ROOTS_STATE_PATH.read_text(encoding="utf-8")) or {}
+        )
         if isinstance(payload, dict) and payload:
             srcs = []
             for value in payload.values():
