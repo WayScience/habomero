@@ -51,9 +51,8 @@ def run_in_omero(root_password: str, command: str) -> subprocess.CompletedProces
         'export OMERODIR="$(mktemp -d /tmp/omero-sync-XXXXXX)"; '
         "trap 'rm -rf \"$OMERODIR\"' EXIT; "
         'export PATH="/opt/omero/server/venv3/bin:$PATH"; '
-        "omero logout >/dev/null 2>&1 || true; "
-        "omero login root@localhost:4064 -g system "
-        '-w "$OMERO_ROOT_PASSWORD" >/dev/null; '
+        "omero() { command omero -C -s localhost -p 4064 "
+        '-u root -w "$OMERO_ROOT_PASSWORD" -g system "$@"; }; '
         f"{command}"
     )
     args = [
@@ -90,7 +89,7 @@ def run_in_omero(root_password: str, command: str) -> subprocess.CompletedProces
 def wait_for_server(root_password: str) -> None:
     """Wait until OMERO server auth endpoint is ready."""
 
-    check_cmd = 'omero login root@localhost:4064 -w "$OMERO_ROOT_PASSWORD" >/dev/null'
+    check_cmd = "omero version >/dev/null"
     attempts = max(OMERO_WAIT_MAX_SECONDS // OMERO_WAIT_POLL_SECONDS, 1)
     for attempt in range(1, attempts + 1):
         result = run_in_omero(root_password, check_cmd)
