@@ -56,42 +56,47 @@ default-groups = [ "dev" ]
 
 [tool.poe.tasks]
 run.sequence = [
+  "preflight",
   "scan-dirs",
   "provision",
   "up",
+  "healthcheck",
   "sync-users",
   "import-scan",
-  "healthcheck",
 ]
 remote-run.sequence = [
+  "preflight",
   "scan-dirs",
   "up",
-  "sync-users",
   "healthcheck",
+  "sync-users",
   "import-remote-safe",
   "show-url",
 ]
 remote-run-100.sequence = [
+  "preflight",
   "scan-dirs",
   "up",
-  "sync-users",
   "healthcheck",
+  "sync-users",
   "import-remote-safe-100-parallel",
   "show-url",
 ]
 remote-run-100-parallel.sequence = [
+  "preflight",
   "scan-dirs",
   "up",
-  "sync-users",
   "healthcheck",
+  "sync-users",
   "import-remote-safe-100-parallel",
   "show-url",
 ]
 remote-run-parallel-full.sequence = [
+  "preflight",
   "scan-dirs",
   "up",
-  "sync-users",
   "healthcheck",
+  "sync-users",
   "import-remote-safe-continuous-parallel-full",
   "show-url",
 ]
@@ -101,18 +106,25 @@ reset-state.sequence = [
 ]
 reset-and-up.sequence = [
   "reset-state",
+  "preflight",
   "scan-dirs",
   "up",
   "sync-users",
   "healthcheck",
   "show-url",
 ]
+preflight.shell = """
+python scripts/project_guard.py
+python scripts/preflight.py
+"""
 provision.shell = """
 python scripts/project_guard.py
 ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
 """
 up.shell = """
+set -e
 python scripts/project_guard.py
+python scripts/preflight.py
 python scripts/scan_dirs.py
 docker compose -f compose.yml -f data/state/scan_roots.compose.yml up -d
 python scripts/show_access_url.py

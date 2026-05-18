@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 
 
 def run_cmd(command: list[str]) -> bool:
@@ -78,7 +79,17 @@ def get_compose_health() -> list[dict[str, str]]:
 
 
 if __name__ == "__main__":
-    for service in get_compose_health():
+    services = get_compose_health()
+    failed = False
+    for service in services:
         print(
             f"{service['service']}: state={service['state']} health={service['health']}"
         )
+        state = service["state"].strip().lower()
+        health = service["health"].strip().lower()
+        if state != "running":
+            failed = True
+        if health not in {"", "n/a", "healthy"}:
+            failed = True
+    if failed:
+        sys.exit(1)
