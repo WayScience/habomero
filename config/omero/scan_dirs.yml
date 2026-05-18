@@ -20,7 +20,8 @@ import_mode: inplace
 
 # Safety controls for high-latency/remote sources:
 # Maximum number of files to attempt in a single import-scan run.
-max_files_per_run: 25
+# Set to 0 for no cap.
+max_files_per_run: 0
 # Require DB to report healthy N consecutive checks before imports begin.
 db_stable_checks_required: 2
 db_stable_check_interval_seconds: 1

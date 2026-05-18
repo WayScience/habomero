@@ -136,7 +136,7 @@ def load_import_config(  # noqa: C901, PLR0912, PLR0915
                 raise ImportConfigError(
                     "import_mode must be either 'copy' or 'inplace'"
                 )
-        max_files_per_run = positive_int(
+        max_files_per_run = nonnegative_int(
             payload, "max_files_per_run", max_files_per_run
         )
         db_stable_checks = positive_int(
@@ -170,11 +170,11 @@ def load_import_config(  # noqa: C901, PLR0912, PLR0915
             parsed = int(env_cap)
         except ValueError as exc:
             raise ImportConfigError(
-                "IMPORT_MAX_FILES_PER_RUN must be a positive integer"
+                "IMPORT_MAX_FILES_PER_RUN must be a non-negative integer"
             ) from exc
-        if parsed <= 0:
+        if parsed < 0:
             raise ImportConfigError(
-                "IMPORT_MAX_FILES_PER_RUN must be a positive integer"
+                "IMPORT_MAX_FILES_PER_RUN must be a non-negative integer"
             )
         max_files_per_run = parsed
     env_sleep = os.environ.get("IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS", "").strip()
@@ -751,6 +751,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     """Import files for a single root. Returns count, failures, hit_cap."""
 
     imported_count = 0
+    budget_capped = budget_remaining > 0
     skipped_existing_count = 0
     skipped_tracked_count = 0
     failures: dict[str, str] = {}
@@ -761,7 +762,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
             root_files = list_root_files(
                 source_root,
                 container_root,
-                max_files=budget_remaining if budget_remaining > 0 else None,
+                max_files=budget_remaining if budget_capped else None,
                 scan_progress_every_paths=scan_progress_every_paths,
             )
             break
@@ -786,13 +787,13 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
         )
     print(
         f"[root] {source_root}: candidate files={len(root_files)} "
-        f"budget={budget_remaining}"
+        f"budget={budget_remaining if budget_capped else 'uncapped'}"
     )
 
     # Build worklist serially so dataset/project bookkeeping stays consistent.
     work: list[tuple[str, int]] = []
     for abs_path in root_files:
-        if imported_count >= budget_remaining:
+        if budget_capped and imported_count >= budget_remaining:
             print(f"Reached max_files_per_run budget for this run ({budget_remaining})")
             return (
                 imported_count,
@@ -1009,6 +1010,9 @@ def import_files() -> None:
             print(f"[root-failed] {source}: {exc}")
             continue
 
+        budget_remaining = (
+            max_files_per_run - imported_count if max_files_per_run > 0 else 0
+        )
         root_imported, root_failures, hit_cap, root_stats = import_root_files(
             owner,
             owner_password,
@@ -1020,7 +1024,7 @@ def import_files() -> None:
             project_id,
             imported,
             dataset_state,
-            max_files_per_run - imported_count,
+            budget_remaining,
             max_failures_per_run,
             sleep_between_imports_seconds,
             scan_progress_every_paths,

@@ -1,3 +1,4 @@
+---
 services:
   db:
     image: postgres:16
@@ -29,6 +30,13 @@ services:
       CONFIG_omero_db_pass: ${POSTGRES_PASSWORD}
       CONFIG_omero_db_name: ${POSTGRES_DB}
       CONFIG_omero_db_port: "5432"
+      # Session timeout controls (milliseconds)
+      CONFIG_omero_sessions_timeout:
+        "${OMERO_SESSIONS_TIMEOUT_MS:-3600000}"
+      CONFIG_omero_sessions_max_user_time_to_idle:
+        "${OMERO_SESSIONS_MAX_IDLE_MS:-86400000}"
+      CONFIG_omero_sessions_max_user_time_to_live:
+        "${OMERO_SESSIONS_MAX_TTL_MS:-0}"
     ports:
       - "4063:4063"
       - "4064:4064"
@@ -44,6 +52,9 @@ services:
     environment:
       OMEROHOST: omero-server
       CONFIG_omero_web_debug: "false"
+      # Keep web sessions after browser close unless explicitly disabled.
+      CONFIG_omero_web_session_expire_at_browser_close:
+        "${OMERO_WEB_SESSION_EXPIRE_AT_BROWSER_CLOSE:-false}"
     ports:
       - "${OMERO_WEB_PORT}:4080"
     volumes:
