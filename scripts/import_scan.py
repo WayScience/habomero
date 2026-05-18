@@ -877,6 +877,8 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 continue
 
             imported.add(tracked)
+            # Persist immediately so interrupted runs don't replay this file.
+            save_string_set(IMPORT_STATE_PATH, imported)
             imported_count += 1
             dataset_image_cache.setdefault(dataset_id, set()).add(Path(abs_path).name)
             if imported_count % import_progress_every_files == 0:
@@ -937,6 +939,8 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     )
                 continue
             imported.add(tracked)
+            # Persist immediately so interrupted runs don't replay this file.
+            save_string_set(IMPORT_STATE_PATH, imported)
             imported_count += 1
             dataset_image_cache.setdefault(dataset_id, set()).add(Path(abs_path).name)
             if imported_count % import_progress_every_files == 0:
@@ -956,7 +960,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     )
 
 
-def import_files() -> None:
+def import_files() -> None:  # noqa: PLR0915
     credentials, owner = load_user_credentials()
     owner_password = credentials[owner]
     (
@@ -991,67 +995,77 @@ def import_files() -> None:
     total_queued = 0
     total_skipped_tracked = 0
     total_skipped_existing = 0
-    for root_key, root_data in sorted(roots.items()):
-        source = root_data["source"]
-        container_root = root_data["container_root"]
-        print(f"[root-begin] {root_key} source={source}")
-        print(f"[root-begin] {root_key} container_root={container_root}")
-        try:
-            project_id = get_or_create_project(
+    interrupted = False
+    try:
+        for root_key, root_data in sorted(roots.items()):
+            source = root_data["source"]
+            container_root = root_data["container_root"]
+            print(f"[root-begin] {root_key} source={source}")
+            print(f"[root-begin] {root_key} container_root={container_root}")
+            try:
+                project_id = get_or_create_project(
+                    owner,
+                    owner_password,
+                    shared_group,
+                    root_key,
+                    root_prefix,
+                    source,
+                    project_state,
+                )
+            except RuntimeError as exc:
+                print(f"[root-failed] {source}: {exc}")
+                continue
+
+            budget_remaining = (
+                max_files_per_run - imported_count if max_files_per_run > 0 else 0
+            )
+            root_imported, root_failures, hit_cap, root_stats = import_root_files(
                 owner,
                 owner_password,
                 shared_group,
+                import_mode,
                 root_key,
-                root_prefix,
                 source,
-                project_state,
+                container_root,
+                project_id,
+                imported,
+                dataset_state,
+                budget_remaining,
+                max_failures_per_run,
+                sleep_between_imports_seconds,
+                scan_progress_every_paths,
+                import_progress_every_files,
+                import_workers,
             )
-        except RuntimeError as exc:
-            print(f"[root-failed] {source}: {exc}")
-            continue
-
-        budget_remaining = (
-            max_files_per_run - imported_count if max_files_per_run > 0 else 0
-        )
-        root_imported, root_failures, hit_cap, root_stats = import_root_files(
-            owner,
-            owner_password,
-            shared_group,
-            import_mode,
-            root_key,
-            source,
-            container_root,
-            project_id,
-            imported,
-            dataset_state,
-            budget_remaining,
-            max_failures_per_run,
-            sleep_between_imports_seconds,
-            scan_progress_every_paths,
-            import_progress_every_files,
-            import_workers,
-        )
-        imported_count += root_imported
-        failures.update(root_failures)
-        total_candidates += root_stats["candidates"]
-        total_queued += root_stats["queued"]
-        total_skipped_tracked += root_stats["skipped_tracked"]
-        total_skipped_existing += root_stats["skipped_existing"]
-        print(
-            f"[root-end] {root_key} imported_this_root={root_imported} "
-            f"failures_this_root={len(root_failures)} "
-            f"candidates={root_stats['candidates']} "
-            f"queued={root_stats['queued']} "
-            f"skipped_tracked={root_stats['skipped_tracked']} "
-            f"skipped_existing={root_stats['skipped_existing']}"
-        )
-        if hit_cap:
-            break
-
-    save_string_set(IMPORT_STATE_PATH, imported)
-    save_int_map(DATASET_STATE_PATH, dataset_state)
-    save_int_map(PROJECT_STATE_PATH, project_state)
-    save_failure_map(FAILURE_STATE_PATH, failures)
+            imported_count += root_imported
+            failures.update(root_failures)
+            total_candidates += root_stats["candidates"]
+            total_queued += root_stats["queued"]
+            total_skipped_tracked += root_stats["skipped_tracked"]
+            total_skipped_existing += root_stats["skipped_existing"]
+            print(
+                f"[root-end] {root_key} imported_this_root={root_imported} "
+                f"failures_this_root={len(root_failures)} "
+                f"candidates={root_stats['candidates']} "
+                f"queued={root_stats['queued']} "
+                f"skipped_tracked={root_stats['skipped_tracked']} "
+                f"skipped_existing={root_stats['skipped_existing']}"
+            )
+            # Checkpoint state per root so restart can't replay completed root work.
+            save_string_set(IMPORT_STATE_PATH, imported)
+            save_int_map(DATASET_STATE_PATH, dataset_state)
+            save_int_map(PROJECT_STATE_PATH, project_state)
+            save_failure_map(FAILURE_STATE_PATH, failures)
+            if hit_cap:
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        print("[import] interrupted, checkpointing state before exit")
+    finally:
+        save_string_set(IMPORT_STATE_PATH, imported)
+        save_int_map(DATASET_STATE_PATH, dataset_state)
+        save_int_map(PROJECT_STATE_PATH, project_state)
+        save_failure_map(FAILURE_STATE_PATH, failures)
     imported_after = len(imported)
     print(
         "[run-summary] "
@@ -1060,6 +1074,8 @@ def import_files() -> None:
         f"skipped_existing={total_skipped_existing} failures={len(failures)} "
         f"tracked_before={imported_before} tracked_after={imported_after}"
     )
+    if interrupted:
+        return
     if imported_count == 0:
         print("No new files to import")
     else:

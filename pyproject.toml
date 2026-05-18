@@ -142,8 +142,8 @@ python scripts/project_guard.py
 if [ -d data ]; then
   docker run --rm --user 0:0 -v "$(pwd)/data:/data" postgres:16 sh -lc "chown -R $(id -u):$(id -g) /data" || true
 fi
-rm -rf data/postgres data/omero data/omero-web-var data/state
-mkdir -p data/postgres data/omero data/omero-web-var data/state
+rm -rf data/postgres data/omero data/omero-web-var data/state data/backups
+mkdir -p data/postgres data/omero data/omero-web-var data/state data/backups
 """
 logs.shell = """
 python scripts/project_guard.py
