@@ -747,11 +747,12 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     scan_progress_every_paths: int,
     import_progress_every_files: int,
     import_workers: int,
-) -> tuple[int, dict[str, str], bool]:
+) -> tuple[int, dict[str, str], bool, dict[str, int]]:
     """Import files for a single root. Returns count, failures, hit_cap."""
 
     imported_count = 0
     skipped_existing_count = 0
+    skipped_tracked_count = 0
     failures: dict[str, str] = {}
     dataset_image_cache: dict[int, set[str]] = {}
     root_files: list[str] | None = None
@@ -772,7 +773,17 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
             time.sleep(LIST_RETRY_BACKOFF_SECONDS * attempt)
     if root_files is None:
         print(f"[root-list-failed] {source_root}")
-        return 0, {}, False
+        return (
+            0,
+            {},
+            False,
+            {
+                "candidates": 0,
+                "queued": 0,
+                "skipped_tracked": 0,
+                "skipped_existing": 0,
+            },
+        )
     print(
         f"[root] {source_root}: candidate files={len(root_files)} "
         f"budget={budget_remaining}"
@@ -783,11 +794,22 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     for abs_path in root_files:
         if imported_count >= budget_remaining:
             print(f"Reached max_files_per_run budget for this run ({budget_remaining})")
-            return imported_count, failures, True
+            return (
+                imported_count,
+                failures,
+                True,
+                {
+                    "candidates": len(root_files),
+                    "queued": len(work),
+                    "skipped_tracked": skipped_tracked_count,
+                    "skipped_existing": skipped_existing_count,
+                },
+            )
         tracking_key = f"{root_key}:{abs_path}"
         if imported_count % 10 == 0:
             print(f"[import-candidate] {abs_path}")
         if tracking_key in imported:
+            skipped_tracked_count += 1
             continue
         rel_path = rel_path_from_root(abs_path, container_root)
         rel_dir = dataset_key_for_rel_path(rel_path)
@@ -840,7 +862,17 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                         f"Reached failure cap ({max_failures_per_run}), "
                         "stopping import run"
                     )
-                    return imported_count, failures, True
+                    return (
+                        imported_count,
+                        failures,
+                        True,
+                        {
+                            "candidates": len(root_files),
+                            "queued": len(work),
+                            "skipped_tracked": skipped_tracked_count,
+                            "skipped_existing": skipped_existing_count,
+                        },
+                    )
                 continue
 
             imported.add(tracked)
@@ -851,7 +883,17 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
             time.sleep(sleep_between_imports_seconds)
             if sleep_between_imports_seconds > 0:
                 print(f"[pace] slept {sleep_between_imports_seconds}s")
-        return imported_count, failures, False
+        return (
+            imported_count,
+            failures,
+            False,
+            {
+                "candidates": len(root_files),
+                "queued": len(work),
+                "skipped_tracked": skipped_tracked_count,
+                "skipped_existing": skipped_existing_count,
+            },
+        )
 
     print(f"[parallel] enabled with import_workers={import_workers}")
     with ThreadPoolExecutor(max_workers=import_workers) as pool:
@@ -881,7 +923,17 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                         f"Reached failure cap ({max_failures_per_run}), "
                         "stopping import run"
                     )
-                    return imported_count, failures, True
+                    return (
+                        imported_count,
+                        failures,
+                        True,
+                        {
+                            "candidates": len(root_files),
+                            "queued": len(work),
+                            "skipped_tracked": skipped_tracked_count,
+                            "skipped_existing": skipped_existing_count,
+                        },
+                    )
                 continue
             imported.add(tracked)
             imported_count += 1
@@ -890,7 +942,17 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 print(f"[root-progress] imported={imported_count} for {source_root}")
     if skipped_existing_count > 0:
         print(f"[dedupe] skipped {skipped_existing_count} existing image(s)")
-    return imported_count, failures, False
+    return (
+        imported_count,
+        failures,
+        False,
+        {
+            "candidates": len(root_files),
+            "queued": len(work),
+            "skipped_tracked": skipped_tracked_count,
+            "skipped_existing": skipped_existing_count,
+        },
+    )
 
 
 def import_files() -> None:
@@ -918,11 +980,16 @@ def import_files() -> None:
     print(f"[import] loaded roots={len(roots)} mode={import_mode}")
 
     imported = load_string_set(IMPORT_STATE_PATH)
+    imported_before = len(imported)
     dataset_state = load_int_map(DATASET_STATE_PATH)
     project_state = load_int_map(PROJECT_STATE_PATH)
 
     imported_count = 0
     failures: dict[str, str] = {}
+    total_candidates = 0
+    total_queued = 0
+    total_skipped_tracked = 0
+    total_skipped_existing = 0
     for root_key, root_data in sorted(roots.items()):
         source = root_data["source"]
         container_root = root_data["container_root"]
@@ -942,7 +1009,7 @@ def import_files() -> None:
             print(f"[root-failed] {source}: {exc}")
             continue
 
-        root_imported, root_failures, hit_cap = import_root_files(
+        root_imported, root_failures, hit_cap, root_stats = import_root_files(
             owner,
             owner_password,
             shared_group,
@@ -962,9 +1029,17 @@ def import_files() -> None:
         )
         imported_count += root_imported
         failures.update(root_failures)
+        total_candidates += root_stats["candidates"]
+        total_queued += root_stats["queued"]
+        total_skipped_tracked += root_stats["skipped_tracked"]
+        total_skipped_existing += root_stats["skipped_existing"]
         print(
             f"[root-end] {root_key} imported_this_root={root_imported} "
-            f"failures_this_root={len(root_failures)}"
+            f"failures_this_root={len(root_failures)} "
+            f"candidates={root_stats['candidates']} "
+            f"queued={root_stats['queued']} "
+            f"skipped_tracked={root_stats['skipped_tracked']} "
+            f"skipped_existing={root_stats['skipped_existing']}"
         )
         if hit_cap:
             break
@@ -973,6 +1048,14 @@ def import_files() -> None:
     save_int_map(DATASET_STATE_PATH, dataset_state)
     save_int_map(PROJECT_STATE_PATH, project_state)
     save_failure_map(FAILURE_STATE_PATH, failures)
+    imported_after = len(imported)
+    print(
+        "[run-summary] "
+        f"candidates={total_candidates} queued={total_queued} "
+        f"imported_new={imported_count} skipped_tracked={total_skipped_tracked} "
+        f"skipped_existing={total_skipped_existing} failures={len(failures)} "
+        f"tracked_before={imported_before} tracked_after={imported_after}"
+    )
     if imported_count == 0:
         print("No new files to import")
     else:

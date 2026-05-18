@@ -106,6 +106,51 @@ def ensure_group(root_password: str, group: str) -> None:
         print(f"group-exists: {group}")
 
 
+def ensure_user_group_membership(root_password: str, username: str, group: str) -> None:
+    """Ensure a user is a member of a target group."""
+
+    join_result = run_in_omero(
+        root_password,
+        f"omero user joingroup {group} --name={username}",
+    )
+    if join_result.returncode == 0:
+        print(f"group-ok: {username} -> {group}")
+        return
+
+    stderr = join_result.stderr.strip()
+    if "already" in stderr.lower():
+        print(f"group-exists: {username} -> {group}")
+        return
+
+    raise RuntimeError(f"Failed to set group membership for '{username}': {stderr}")
+
+
+def ensure_default_group(
+    root_password: str,
+    username: str,
+    group: str,
+) -> None:
+    """Best-effort set user's default group for OMERO.web visibility."""
+
+    commands = [
+        f"omero user defaultgroup --name={username} {group}",
+        f"omero user defaultgroup {group} --name={username}",
+        f"omero user defaultgroup --user-name {username} {group}",
+    ]
+    last_error = ""
+    for cmd in commands:
+        result = run_in_omero(root_password, cmd)
+        if result.returncode == 0:
+            print(f"default-group-ok: {username} -> {group}")
+            return
+        last_error = result.stderr.strip() or result.stdout.strip()
+    print(
+        "default-group-warn: "
+        f"could not set default group for {username} -> {group} "
+        f"(manual group switch may be needed): {last_error}"
+    )
+
+
 def ensure_user(root_password: str, user: dict[str, str]) -> None:
     """Create user if missing and ensure group membership is present."""
 
@@ -158,20 +203,7 @@ def ensure_user(root_password: str, user: dict[str, str]) -> None:
         if not password_set:
             print(f"password-unchanged: {username} ({last_error})")
 
-    join_result = run_in_omero(
-        root_password,
-        f"omero user joingroup {group} --name={username}",
-    )
-    if join_result.returncode == 0:
-        print(f"group-ok: {username} -> {group}")
-        return
-
-    stderr = join_result.stderr.strip()
-    if "already" in stderr.lower():
-        print(f"group-exists: {username} -> {group}")
-        return
-
-    raise RuntimeError(f"Failed to set group membership for '{username}': {stderr}")
+    ensure_user_group_membership(root_password, username, group)
 
 
 def load_users() -> list[dict[str, str]]:  # noqa: C901
@@ -256,16 +288,11 @@ def main() -> None:
     shared_group = load_shared_group()
     for user in users:
         ensure_user(root_password, user)
+        ensure_default_group(root_password, user["username"], user["group"])
         if shared_group and user["group"] != shared_group:
             ensure_group(root_password, shared_group)
-            join_result = run_in_omero(
-                root_password,
-                f"omero user joingroup {shared_group} --name={user['username']}",
-            )
-            if join_result.returncode == 0:
-                print(f"group-ok: {user['username']} -> {shared_group}")
-            elif "already" in join_result.stderr.lower():
-                print(f"group-exists: {user['username']} -> {shared_group}")
+            ensure_user_group_membership(root_password, user["username"], shared_group)
+            ensure_default_group(root_password, user["username"], shared_group)
 
 
 if __name__ == "__main__":
