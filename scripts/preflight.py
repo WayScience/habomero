@@ -93,6 +93,26 @@ def check_docker_bridge_network() -> str | None:
     return f"Docker bridge network is unavailable: {detail}"
 
 
+def check_docker_bridge_container_start() -> str | None:
+    """Best-effort bridge datapath check using a local Alpine image."""
+
+    present = run(["docker", "image", "inspect", "alpine:3.20"])
+    if present.returncode != 0:
+        return None
+
+    result = run(
+        ["docker", "run", "--rm", "--network", "bridge", "alpine:3.20", "true"]
+    )
+    if result.returncode == 0:
+        return None
+    detail = (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or "bridge container start failed"
+    )
+    return f"Docker bridge container start failed: {detail}"
+
+
 def check_core_requirements(errors: list[str]) -> None:
     """Validate required binaries and Docker daemon availability."""
 
@@ -110,6 +130,9 @@ def check_core_requirements(errors: list[str]) -> None:
     bridge_error = check_docker_bridge_network()
     if bridge_error:
         errors.append(bridge_error)
+    bridge_start_error = check_docker_bridge_container_start()
+    if bridge_start_error:
+        errors.append(bridge_start_error)
 
 
 def check_linux_host(errors: list[str], warnings: list[str]) -> None:
@@ -119,11 +142,7 @@ def check_linux_host(errors: list[str], warnings: list[str]) -> None:
         return
 
     linux_issues = check_linux_networking()
-    for issue in linux_issues:
-        if "not loaded" in issue:
-            errors.append(issue)
-        else:
-            warnings.append(issue)
+    warnings.extend(linux_issues)
     if os.geteuid() != 0:
         warnings.append(
             "Running as non-root user; if Docker is rootless, bridge/veth "
