@@ -100,6 +100,18 @@ to all group members. Set `import_mode: inplace` in
 `config/omero/scan_dirs.yml` to avoid duplicate storage by importing file
 references instead of copying pixel data.
 
+- Production-style full-dataset parallel ingest with periodic rescan:
+
+```bash
+uv run poe remote-run-parallel-full
+```
+
+`remote-run-parallel-full` performs startup (`scan-dirs`, `up`, `sync-users`,
+`healthcheck`) and then starts continuous full-dataset safe import in parallel
+mode. It keeps rescanning and importing indefinitely. Default pause between
+cycles is 300 seconds and is controlled by `safe_import_cycle_pause_seconds` in
+`config/omero/scan_dirs.yml`.
+
 - Sync allowlisted OMERO users:
 
 ```bash

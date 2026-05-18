@@ -76,7 +76,7 @@ remote-run-100.sequence = [
   "up",
   "sync-users",
   "healthcheck",
-  "import-scan-100-parallel",
+  "import-remote-safe-100-parallel",
   "show-url",
 ]
 remote-run-100-parallel.sequence = [
@@ -84,7 +84,15 @@ remote-run-100-parallel.sequence = [
   "up",
   "sync-users",
   "healthcheck",
-  "import-scan-100-parallel",
+  "import-remote-safe-100-parallel",
+  "show-url",
+]
+remote-run-parallel-full.sequence = [
+  "scan-dirs",
+  "up",
+  "sync-users",
+  "healthcheck",
+  "import-remote-safe-continuous-parallel-full",
   "show-url",
 ]
 reset-state.sequence = [
@@ -162,6 +170,30 @@ import-remote-safe.shell = """
 python scripts/project_guard.py
 python scripts/show_access_url.py
 python scripts/import_remote_safe.py
+python scripts/show_access_url.py
+"""
+import-remote-safe-parallel-full.shell = """
+python scripts/project_guard.py
+python scripts/show_access_url.py
+SAFE_IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS=0 SAFE_IMPORT_SCAN_PROGRESS_EVERY_PATHS=50000 SAFE_IMPORT_PROGRESS_EVERY_FILES=50 SAFE_IMPORT_WORKERS=${IMPORT_WORKERS:-2} python scripts/import_remote_safe.py
+python scripts/show_access_url.py
+"""
+import-remote-safe-continuous-parallel-full.shell = """
+python scripts/project_guard.py
+python scripts/show_access_url.py
+SAFE_IMPORT_CONTINUOUS=1 SAFE_IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS=0 SAFE_IMPORT_SCAN_PROGRESS_EVERY_PATHS=50000 SAFE_IMPORT_PROGRESS_EVERY_FILES=50 SAFE_IMPORT_WORKERS=${IMPORT_WORKERS:-2} python scripts/import_remote_safe.py
+python scripts/show_access_url.py
+"""
+import-remote-safe-100-parallel.shell = """
+python scripts/project_guard.py
+python scripts/show_access_url.py
+SAFE_IMPORT_MAX_FILES_PER_RUN=100 SAFE_IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS=0 SAFE_IMPORT_SCAN_PROGRESS_EVERY_PATHS=50000 SAFE_IMPORT_PROGRESS_EVERY_FILES=50 SAFE_IMPORT_WORKERS=${IMPORT_WORKERS:-2} python scripts/import_remote_safe.py
+python scripts/show_access_url.py
+"""
+import-remote-safe-continuous-100-parallel.shell = """
+python scripts/project_guard.py
+python scripts/show_access_url.py
+SAFE_IMPORT_CONTINUOUS=1 SAFE_IMPORT_MAX_FILES_PER_RUN=100 SAFE_IMPORT_SLEEP_BETWEEN_IMPORTS_SECONDS=0 SAFE_IMPORT_SCAN_PROGRESS_EVERY_PATHS=50000 SAFE_IMPORT_PROGRESS_EVERY_FILES=50 SAFE_IMPORT_WORKERS=${IMPORT_WORKERS:-2} python scripts/import_remote_safe.py
 python scripts/show_access_url.py
 """
 show-url.shell = """

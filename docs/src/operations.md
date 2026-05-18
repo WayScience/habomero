@@ -28,6 +28,35 @@ uv run poe logs
 
 All `poe` tasks must be run from the project root directory.
 
+## Continuous production ingest (full dataset)
+
+Start stack and run full-dataset parallel import:
+
+```bash
+uv run poe remote-run-parallel-full
+```
+
+This command now starts continuous periodic rescans/imports automatically.
+You can still run the ingest loop directly:
+
+```bash
+uv run poe import-remote-safe-continuous-parallel-full
+```
+
+Key settings in `config/omero/scan_dirs.yml`:
+
+- `safe_import_rounds`: rounds per cycle
+- `safe_import_pause_seconds`: pause between rounds in a cycle
+- `safe_import_stagnant_rounds`: stop cycle after stagnant progress
+- `safe_import_cycle_pause_seconds`: pause between cycles (default `300`)
+- `safe_import_continuous`: whether safe-import loops continuously by config
+
+Parallelism can be tuned at runtime:
+
+```bash
+IMPORT_WORKERS=4 uv run poe import-remote-safe-continuous-parallel-full
+```
+
 ## Configure user access allowlist
 
 Edit `config/omero/users.yml` and define approved user accounts.
