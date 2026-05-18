@@ -48,6 +48,8 @@ def run_in_omero(root_password: str, command: str) -> subprocess.CompletedProces
 
     full_command = (
         "set -euo pipefail; "
+        'export OMERODIR="$(mktemp -d /tmp/omero-sync-XXXXXX)"; '
+        "trap 'rm -rf \"$OMERODIR\"' EXIT; "
         'export PATH="/opt/omero/server/venv3/bin:$PATH"; '
         "omero logout >/dev/null 2>&1 || true; "
         "omero login root@localhost:4064 -g system "
