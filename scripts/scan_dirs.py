@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -80,12 +82,37 @@ def materialize_scan_roots(paths: list[Path]) -> dict[str, dict[str, str]]:
 
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    except PermissionError as exc:
-        raise PermissionError(
-            "Cannot write scan state directory "
-            f"{STATE_PATH.parent}. Fix with: "
-            "sudo chown -R $(id -u):$(id -g) data"
-        ) from exc
+    except PermissionError:
+        data_dir = PROJECT_ROOT / "data"
+        uid = os.getuid()
+        gid = os.getgid()
+        fix = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "0:0",
+                "-v",
+                f"{data_dir}:/data",
+                "postgres:16",
+                "sh",
+                "-lc",
+                f"chown -R {uid}:{gid} /data && chmod -R u+rwX,g+rwX /data",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if fix.returncode == 0:
+            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            detail = fix.stderr.strip() or fix.stdout.strip() or "auto-fix failed"
+            raise PermissionError(
+                "Cannot write scan state directory "
+                f"{STATE_PATH.parent}. Auto-fix failed: {detail}. "
+                "Fix with: sudo chown -R $(id -u):$(id -g) data"
+            ) from None
     STATE_PATH.write_text(yaml.safe_dump(mapping, sort_keys=True), encoding="utf-8")
     override = {"services": {"omero-server": {"volumes": volumes}}}
     COMPOSE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
