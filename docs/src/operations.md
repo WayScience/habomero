@@ -4,6 +4,7 @@
 
 ```bash
 cp .env.example .env
+uv run poe preflight
 uv run poe scan-dirs
 uv run poe provision
 uv run poe up
@@ -27,6 +28,7 @@ uv run poe logs
 ```
 
 All `poe` tasks must be run from the project root directory.
+`up` and the main `remote-run*` tasks also run `preflight` automatically.
 
 ## Continuous production ingest (full dataset)
 
