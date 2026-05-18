@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config/omero/users.yml"
 SCAN_CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
 ENV_PATH = PROJECT_ROOT / ".env"
+OMERO_CMD_TIMEOUT_SECONDS = 30
 
 
 class UserConfigError(ValueError):
@@ -49,23 +50,35 @@ def run_in_omero(root_password: str, command: str) -> subprocess.CompletedProces
         'omero login root@localhost:4064 -w "$OMERO_ROOT_PASSWORD" >/dev/null; '
         f"{command}"
     )
-    return subprocess.run(
-        [
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "-e",
-            f"OMERO_ROOT_PASSWORD={root_password}",
-            "omero-server",
-            "bash",
-            "-lc",
-            full_command,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    args = [
+        "docker",
+        "compose",
+        "exec",
+        "-T",
+        "-e",
+        f"OMERO_ROOT_PASSWORD={root_password}",
+        "omero-server",
+        "bash",
+        "-lc",
+        full_command,
+    ]
+    try:
+        return subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=OMERO_CMD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=124,
+            stdout="",
+            stderr=(
+                f"Timed out running OMERO command after {OMERO_CMD_TIMEOUT_SECONDS}s"
+            ),
+        )
 
 
 def wait_for_server(root_password: str) -> None:
