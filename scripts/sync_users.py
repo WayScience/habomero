@@ -106,6 +106,42 @@ def ensure_group(root_password: str, group: str) -> None:
         print(f"group-exists: {group}")
 
 
+def ensure_group_permissions(
+    root_password: str,
+    group: str,
+    permissions: str,
+) -> None:
+    """Best-effort set data-group permissions for shared visibility."""
+
+    permission_map = {
+        "private": "rw----",
+        "read-only": "rwr---",
+        "read-annotate": "rwra--",
+        "read-write": "rwrw--",
+    }
+    normalized = permissions.strip().lower()
+    perm_value = permission_map.get(normalized, permissions.strip())
+    quoted_perm = shlex.quote(perm_value)
+    quoted_group = shlex.quote(group)
+
+    commands = [
+        f"omero group perms --perms={quoted_perm} --name={quoted_group}",
+        f"omero group perms --perms={quoted_perm} {quoted_group}",
+        f"omero group perms {quoted_group} --perms={quoted_perm}",
+    ]
+    last_error = ""
+    for cmd in commands:
+        result = run_in_omero(root_password, cmd)
+        if result.returncode == 0:
+            print(f"group-perms-ok: {group} -> {perm_value}")
+            return
+        last_error = result.stderr.strip() or result.stdout.strip()
+    print(
+        "group-perms-warn: "
+        f"could not set permissions for {group} -> {perm_value}: {last_error}"
+    )
+
+
 def ensure_user_group_membership(root_password: str, username: str, group: str) -> None:
     """Ensure a user is a member of a target group."""
 
@@ -131,6 +167,12 @@ def ensure_default_group(
     group: str,
 ) -> None:
     """Best-effort set user's default group for OMERO.web visibility."""
+
+    help_result = run_in_omero(root_password, "omero user -h")
+    text = f"{help_result.stdout}\n{help_result.stderr}".lower()
+    if "defaultgroup" not in text:
+        print(f"default-group-skip: CLI unsupported; keep existing for {username}")
+        return
 
     commands = [
         f"omero user defaultgroup --name={username} {group}",
@@ -279,6 +321,23 @@ def load_shared_group() -> str | None:
     return group.strip()
 
 
+def load_shared_group_permissions() -> str:
+    """Load optional shared-group permissions for imported-data visibility."""
+
+    default = "read-annotate"
+    if not SCAN_CONFIG_PATH.exists():
+        return default
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    raw = payload.get("shared_group_permissions")
+    if raw is None:
+        return default
+    if not isinstance(raw, str) or not raw.strip():
+        raise UserConfigError(
+            "shared_group_permissions must be a non-empty string when provided"
+        )
+    return raw.strip()
+
+
 def main() -> None:
     """Load user config and sync each entry into OMERO."""
 
@@ -286,11 +345,14 @@ def main() -> None:
     wait_for_server(root_password)
     users = load_users()
     shared_group = load_shared_group()
+    shared_group_permissions = load_shared_group_permissions()
+    if shared_group:
+        ensure_group(root_password, shared_group)
+        ensure_group_permissions(root_password, shared_group, shared_group_permissions)
     for user in users:
         ensure_user(root_password, user)
         ensure_default_group(root_password, user["username"], user["group"])
         if shared_group and user["group"] != shared_group:
-            ensure_group(root_password, shared_group)
             ensure_user_group_membership(root_password, user["username"], shared_group)
             ensure_default_group(root_password, user["username"], shared_group)
 

@@ -6,6 +6,9 @@ scan_directories:
 # Optional shared OMERO group for imports. All configured users are joined
 # to this group by sync-users, and imports use this group context.
 shared_group: lab
+# Optional permission profile applied to shared_group by sync-users.
+# Typical value for collaboration visibility: read-annotate
+shared_group_permissions: read-annotate
 
 # Optional root folder name in OMERO for mirrored filesystem hierarchy.
 omero_folder_root: scan-root
