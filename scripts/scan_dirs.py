@@ -44,7 +44,15 @@ def load_scan_directories() -> list[Path]:
 
         resolved.append(target)
 
-    return resolved
+    # De-duplicate and collapse nested paths so one file tree is scanned once.
+    unique_paths = sorted(set(resolved), key=lambda p: (len(p.parts), str(p)))
+    collapsed: list[Path] = []
+    for candidate in unique_paths:
+        if any(parent in [candidate, *candidate.parents] for parent in collapsed):
+            print(f"skip-overlap: {candidate}")
+            continue
+        collapsed.append(candidate)
+    return collapsed
 
 
 def root_key(path: Path) -> str:

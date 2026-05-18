@@ -32,11 +32,13 @@ sleep_between_imports_seconds: 2
 
 # Remote-safe round runner (`uv run poe import-remote-safe`)
 safe_import_rounds: 30
-safe_import_pause_seconds: 20
+# Keep rounds responsive during active ingest while avoiding busy-loop churn.
+safe_import_pause_seconds: 5
 safe_import_stagnant_rounds: 3
 
 # Optional continuous periodic rescans (safe-import loop)
 # When true, import_remote_safe keeps cycling indefinitely.
 safe_import_continuous: false
 # Pause between completed safe-import cycles in continuous mode.
-safe_import_cycle_pause_seconds: 300
+# Lower than 300s to catch new files sooner without thrashing.
+safe_import_cycle_pause_seconds: 60

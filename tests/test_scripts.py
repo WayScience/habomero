@@ -44,3 +44,27 @@ def test_validate_layout_missing_path_raises(
 
     with pytest.raises(FileNotFoundError, match="compose.yml"):
         validate.validate_layout()
+
+
+def test_scan_dirs_collapses_overlapping_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested configured scan roots should collapse to the broader root."""
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    root = project_root / "data"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+
+    config_path = project_root / "scan_dirs.yml"
+    config_path.write_text(
+        "scan_directories:\n  - data\n  - data/nested\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(scan_dirs, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(scan_dirs, "CONFIG_PATH", config_path)
+
+    result = scan_dirs.load_scan_directories()
+    assert result == [root.resolve()]
