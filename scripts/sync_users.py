@@ -15,6 +15,8 @@ CONFIG_PATH = PROJECT_ROOT / "config/omero/users.yml"
 SCAN_CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
 ENV_PATH = PROJECT_ROOT / ".env"
 OMERO_CMD_TIMEOUT_SECONDS = 30
+OMERO_WAIT_MAX_SECONDS = 180
+OMERO_WAIT_POLL_SECONDS = 3
 
 
 class UserConfigError(ValueError):
@@ -47,7 +49,9 @@ def run_in_omero(root_password: str, command: str) -> subprocess.CompletedProces
     full_command = (
         "set -euo pipefail; "
         'export PATH="/opt/omero/server/venv3/bin:$PATH"; '
-        'omero login root@localhost:4064 -w "$OMERO_ROOT_PASSWORD" >/dev/null; '
+        "omero logout >/dev/null 2>&1 || true; "
+        "omero login root@localhost:4064 -g system "
+        '-w "$OMERO_ROOT_PASSWORD" >/dev/null; '
         f"{command}"
     )
     args = [
@@ -85,13 +89,26 @@ def wait_for_server(root_password: str) -> None:
     """Wait until OMERO server auth endpoint is ready."""
 
     check_cmd = 'omero login root@localhost:4064 -w "$OMERO_ROOT_PASSWORD" >/dev/null'
-    for _ in range(40):
+    attempts = max(OMERO_WAIT_MAX_SECONDS // OMERO_WAIT_POLL_SECONDS, 1)
+    for attempt in range(1, attempts + 1):
         result = run_in_omero(root_password, check_cmd)
         if result.returncode == 0:
+            print(f"[sync-users] OMERO server ready after attempt {attempt}/{attempts}")
             return
-        time.sleep(3)
+        if attempt == 1 or attempt % 5 == 0:
+            detail = (
+                result.stderr.strip() or result.stdout.strip() or "not ready"
+            ).splitlines()[0]
+            print(
+                "[sync-users] waiting for OMERO server "
+                f"attempt={attempt}/{attempts}: {detail}"
+            )
+        time.sleep(OMERO_WAIT_POLL_SECONDS)
 
-    raise RuntimeError("OMERO server did not become ready in time for user sync")
+    raise RuntimeError(
+        "OMERO server did not become ready in time for user sync "
+        f"(waited {OMERO_WAIT_MAX_SECONDS}s)"
+    )
 
 
 def user_exists(root_password: str, username: str) -> bool:
