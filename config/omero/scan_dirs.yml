@@ -30,3 +30,9 @@ sleep_between_imports_seconds: 2
 safe_import_rounds: 30
 safe_import_pause_seconds: 20
 safe_import_stagnant_rounds: 3
+
+# Optional continuous periodic rescans (safe-import loop)
+# When true, import_remote_safe keeps cycling indefinitely.
+safe_import_continuous: false
+# Pause between completed safe-import cycles in continuous mode.
+safe_import_cycle_pause_seconds: 300
