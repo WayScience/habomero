@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 
 
 def run_cmd(command: list[str]) -> bool:
@@ -78,18 +80,44 @@ def get_compose_health() -> list[dict[str, str]]:
     return rows_out
 
 
-if __name__ == "__main__":
-    services = get_compose_health()
-    failed = False
+def all_services_healthy(services: list[dict[str, str]]) -> bool:
+    """Return True when all known services are running and healthy."""
+
     for service in services:
-        print(
-            f"{service['service']}: state={service['state']} health={service['health']}"
-        )
         state = service["state"].strip().lower()
         health = service["health"].strip().lower()
         if state != "running":
-            failed = True
+            return False
         if health not in {"", "n/a", "healthy"}:
-            failed = True
-    if failed:
-        sys.exit(1)
+            return False
+    return True
+
+
+def format_service_status(service: dict[str, str]) -> str:
+    """Render one service status line."""
+
+    name = service["service"]
+    state = service["state"]
+    health = service["health"]
+    return f"{name}: state={state} health={health}"
+
+
+if __name__ == "__main__":
+    wait_seconds = int(os.environ.get("HEALTHCHECK_WAIT_SECONDS", "0"))
+    interval_seconds = int(os.environ.get("HEALTHCHECK_WAIT_INTERVAL_SECONDS", "3"))
+    deadline = time.time() + max(wait_seconds, 0)
+    last: list[dict[str, str]] = []
+    while True:
+        services = get_compose_health()
+        last = services
+        if all_services_healthy(services):
+            for service in services:
+                print(format_service_status(service))
+            sys.exit(0)
+        if time.time() >= deadline:
+            break
+        time.sleep(max(interval_seconds, 1))
+
+    for service in last:
+        print(format_service_status(service))
+    sys.exit(1)

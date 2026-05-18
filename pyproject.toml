@@ -160,7 +160,7 @@ python scripts/restore.py ${BACKUP_FILE}
 """
 healthcheck.shell = """
 python scripts/project_guard.py
-python scripts/healthcheck.py
+HEALTHCHECK_WAIT_SECONDS=${HEALTHCHECK_WAIT_SECONDS:-180} HEALTHCHECK_WAIT_INTERVAL_SECONDS=${HEALTHCHECK_WAIT_INTERVAL_SECONDS:-3} python scripts/healthcheck.py
 """
 sync-users.shell = """
 python scripts/project_guard.py
