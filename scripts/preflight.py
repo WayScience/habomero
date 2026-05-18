@@ -14,10 +14,18 @@ AUTO_FIX_PERMS = os.environ.get("PREFLIGHT_AUTO_FIX_PERMISSIONS", "1").strip() !
 EXPECTED_ID_LINES = 2
 
 
-def run(command: list[str]) -> subprocess.CompletedProcess[str]:
+def run(
+    command: list[str], timeout_seconds: int | None = None
+) -> subprocess.CompletedProcess[str]:
     """Run a command and capture output without raising."""
 
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+    return subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
 
 
 def check_binary(name: str) -> str | None:
@@ -134,19 +142,26 @@ def check_container_volume_write(image: str, host_path: Path) -> str | None:
         # Don't force image pull during preflight.
         return None
 
-    probe = run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{host_path}:/permcheck",
-            image,
-            "bash",
-            "-lc",
-            "set -e; touch /permcheck/.writecheck && rm -f /permcheck/.writecheck",
-        ]
-    )
+    try:
+        probe = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "bash",
+                "-v",
+                f"{host_path}:/permcheck",
+                image,
+                "-lc",
+                "set -e; touch /permcheck/.writecheck && rm -f /permcheck/.writecheck",
+            ],
+            timeout_seconds=20,
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"Container write access probe timed out for {host_path} with image {image}"
+        )
     if probe.returncode == 0:
         return None
 
@@ -161,18 +176,22 @@ def check_container_volume_write(image: str, host_path: Path) -> str | None:
 def default_container_uid_gid(image: str) -> tuple[int, int] | None:
     """Return default runtime uid/gid for an image."""
 
-    probe = run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "bash",
-            image,
-            "-lc",
-            "id -u; id -g",
-        ]
-    )
+    try:
+        probe = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "bash",
+                image,
+                "-lc",
+                "id -u; id -g",
+            ],
+            timeout_seconds=20,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if probe.returncode != 0:
         return None
     lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
@@ -189,24 +208,29 @@ def try_fix_container_volume_write(
 ) -> str | None:
     """Attempt to repair host-path ownership and perms for container writes."""
 
-    fix = run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--user",
-            "0:0",
-            "-v",
-            f"{host_path}:/permcheck",
-            image,
-            "bash",
-            "-lc",
-            (
-                f"chown -R {target_uid}:{target_gid} /permcheck "
-                "&& chmod -R u+rwX,g+rwX /permcheck"
-            ),
-        ]
-    )
+    try:
+        fix = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "bash",
+                "--user",
+                "0:0",
+                "-v",
+                f"{host_path}:/permcheck",
+                image,
+                "-lc",
+                (
+                    f"chown -R {target_uid}:{target_gid} /permcheck "
+                    "&& chmod -R u+rwX,g+rwX /permcheck"
+                ),
+            ],
+            timeout_seconds=120,
+        )
+    except subprocess.TimeoutExpired:
+        return "auto-fix timed out"
     if fix.returncode == 0:
         return None
     detail = fix.stderr.strip() or fix.stdout.strip() or "auto-fix failed"
