@@ -17,6 +17,8 @@ ENV_PATH = PROJECT_ROOT / ".env"
 OMERO_CMD_TIMEOUT_SECONDS = 30
 OMERO_WAIT_MAX_SECONDS = 180
 OMERO_WAIT_POLL_SECONDS = 3
+OMERO_CMD_RETRY_ATTEMPTS = 6
+OMERO_CMD_RETRY_SLEEP_SECONDS = 2
 
 
 class UserConfigError(ValueError):
@@ -86,6 +88,40 @@ def run_in_omero(root_password: str, command: str) -> subprocess.CompletedProces
         )
 
 
+def is_transient_omero_error(stderr: str) -> bool:
+    """Return True for transient OMERO startup/connection failures."""
+
+    text = stderr.lower()
+    markers = (
+        "ice.connectionrefusedexception",
+        "isn't running",
+        "connection refused",
+        "timed out",
+        "failed to connect",
+        "broken pipe",
+    )
+    return any(marker in text for marker in markers)
+
+
+def run_in_omero_with_retry(
+    root_password: str, command: str
+) -> subprocess.CompletedProcess[str]:
+    """Run an OMERO command with transient retry handling."""
+
+    last: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, OMERO_CMD_RETRY_ATTEMPTS + 1):
+        result = run_in_omero(root_password, command)
+        last = result
+        if result.returncode == 0:
+            return result
+        if not is_transient_omero_error(result.stderr):
+            return result
+        if attempt < OMERO_CMD_RETRY_ATTEMPTS:
+            time.sleep(OMERO_CMD_RETRY_SLEEP_SECONDS * attempt)
+    assert last is not None
+    return last
+
+
 def wait_for_server(root_password: str) -> None:
     """Wait until OMERO server auth endpoint is ready."""
 
@@ -115,18 +151,22 @@ def wait_for_server(root_password: str) -> None:
 def user_exists(root_password: str, username: str) -> bool:
     """Return True when user exists in OMERO."""
 
-    result = run_in_omero(root_password, f"omero user info --user-name {username}")
+    result = run_in_omero_with_retry(
+        root_password, f"omero user info --user-name {username}"
+    )
     return result.returncode == 0
 
 
 def ensure_group(root_password: str, group: str) -> None:
     """Create a non-reserved group if it does not already exist."""
 
-    result = run_in_omero(root_password, f"omero group info --group-name {group}")
+    result = run_in_omero_with_retry(
+        root_password, f"omero group info --group-name {group}"
+    )
     if result.returncode == 0:
         return
 
-    created = run_in_omero(root_password, f"omero group add {group}")
+    created = run_in_omero_with_retry(root_password, f"omero group add {group}")
     if created.returncode != 0 and "group exists" not in created.stderr.lower():
         raise RuntimeError(
             f"Failed to create group '{group}': {created.stderr.strip()}"
@@ -162,7 +202,7 @@ def ensure_group_permissions(
     ]
     last_error = ""
     for cmd in commands:
-        result = run_in_omero(root_password, cmd)
+        result = run_in_omero_with_retry(root_password, cmd)
         if result.returncode == 0:
             print(f"group-perms-ok: {group} -> {perm_value}")
             return
@@ -176,7 +216,7 @@ def ensure_group_permissions(
 def ensure_user_group_membership(root_password: str, username: str, group: str) -> None:
     """Ensure a user is a member of a target group."""
 
-    join_result = run_in_omero(
+    join_result = run_in_omero_with_retry(
         root_password,
         f"omero user joingroup {group} --name={username}",
     )
@@ -199,7 +239,7 @@ def ensure_default_group(
 ) -> None:
     """Best-effort set user's default group for OMERO.web visibility."""
 
-    help_result = run_in_omero(root_password, "omero user -h")
+    help_result = run_in_omero_with_retry(root_password, "omero user -h")
     text = f"{help_result.stdout}\n{help_result.stderr}".lower()
     if "defaultgroup" not in text:
         print(f"default-group-skip: CLI unsupported; keep existing for {username}")
@@ -212,7 +252,7 @@ def ensure_default_group(
     ]
     last_error = ""
     for cmd in commands:
-        result = run_in_omero(root_password, cmd)
+        result = run_in_omero_with_retry(root_password, cmd)
         if result.returncode == 0:
             print(f"default-group-ok: {username} -> {group}")
             return
@@ -249,7 +289,7 @@ def ensure_user(root_password: str, user: dict[str, str]) -> None:
             f"--institution {institution_q} "
             f"-P {password_q}"
         )
-        created = run_in_omero(root_password, add_cmd)
+        created = run_in_omero_with_retry(root_password, add_cmd)
         if created.returncode != 0:
             raise RuntimeError(
                 f"Failed to create user '{username}': {created.stderr.strip()}"
@@ -267,7 +307,7 @@ def ensure_user(root_password: str, user: dict[str, str]) -> None:
         password_set = False
         last_error = ""
         for cmd in passwd_commands:
-            update_pass = run_in_omero(root_password, cmd)
+            update_pass = run_in_omero_with_retry(root_password, cmd)
             if update_pass.returncode == 0:
                 print(f"password-set: {username}")
                 password_set = True
