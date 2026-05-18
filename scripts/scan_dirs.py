@@ -78,7 +78,14 @@ def materialize_scan_roots(paths: list[Path]) -> dict[str, dict[str, str]]:
         }
         volumes.append(f"{source}:{container_root}:ro")
 
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(
+            "Cannot write scan state directory "
+            f"{STATE_PATH.parent}. Fix with: "
+            "sudo chown -R $(id -u):$(id -g) data"
+        ) from exc
     STATE_PATH.write_text(yaml.safe_dump(mapping, sort_keys=True), encoding="utf-8")
     override = {"services": {"omero-server": {"volumes": volumes}}}
     COMPOSE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)

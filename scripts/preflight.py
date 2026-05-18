@@ -276,6 +276,75 @@ def check_runtime_volume_permissions(errors: list[str], warnings: list[str]) -> 
             errors.append(issue)
 
 
+def can_write_directory(path: Path) -> bool:
+    """Return True when current host user can create files in path."""
+
+    if not path.exists() or not path.is_dir():
+        return False
+    probe = path / ".preflight-writecheck"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_data_dir_writable(errors: list[str], warnings: list[str]) -> None:
+    """Ensure project data directory is writable by current host user."""
+
+    data_dir = PROJECT_ROOT / "data"
+    if not data_dir.exists():
+        return
+    if can_write_directory(data_dir):
+        return
+
+    if not AUTO_FIX_PERMS:
+        errors.append(
+            f"Project data directory is not writable: {data_dir}. "
+            "Fix with: sudo chown -R $(id -u):$(id -g) data"
+        )
+        return
+
+    uid = os.getuid()
+    gid = os.getgid()
+    fix = run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "-v",
+            f"{data_dir}:/data",
+            "postgres:16",
+            "sh",
+            "-lc",
+            f"chown -R {uid}:{gid} /data && chmod -R u+rwX,g+rwX /data",
+        ],
+        timeout_seconds=120,
+    )
+    if fix.returncode != 0:
+        detail = fix.stderr.strip() or fix.stdout.strip() or "auto-fix failed"
+        errors.append(
+            f"Project data directory is not writable: {data_dir}. "
+            f"Auto-fix failed: {detail}. "
+            "Fix with: sudo chown -R $(id -u):$(id -g) data"
+        )
+        return
+
+    if can_write_directory(data_dir):
+        warnings.append(
+            "Auto-fixed project data directory permissions "
+            f"for {data_dir} (uid:gid {uid}:{gid})"
+        )
+        return
+
+    errors.append(
+        f"Project data directory is still not writable after auto-fix: {data_dir}"
+    )
+
+
 def check_core_requirements(errors: list[str]) -> None:
     """Validate required binaries and Docker daemon availability."""
 
@@ -319,6 +388,7 @@ def main() -> None:
     errors: list[str] = []
     warnings: list[str] = []
     check_core_requirements(errors)
+    ensure_data_dir_writable(errors, warnings)
     check_runtime_volume_permissions(errors, warnings)
     check_linux_host(errors, warnings)
 
