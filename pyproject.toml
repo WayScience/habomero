@@ -113,6 +113,10 @@ reset-and-up.sequence = [
   "healthcheck",
   "show-url",
 ]
+safe-restart.shell = """
+python scripts/project_guard.py
+python scripts/safe_restart.py
+"""
 preflight.shell = """
 python scripts/project_guard.py
 python scripts/preflight.py
