@@ -114,13 +114,48 @@ def stale_lock_files() -> list[Path]:
     return sorted(OMERO_REPOSITORY_ROOT.glob("*/.lock"))
 
 
+def remove_locks_with_root_helper(lock_paths: list[Path]) -> None:
+    """Remove permission-protected lock files via a minimal root container."""
+
+    if not lock_paths:
+        return
+
+    relative_paths = [
+        str(path.relative_to(OMERO_REPOSITORY_ROOT)) for path in lock_paths
+    ]
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "-v",
+            f"{OMERO_REPOSITORY_ROOT}:/repository",
+            "postgres:16",
+            "rm",
+            "-f",
+            *[f"/repository/{path}" for path in relative_paths],
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
+
+
 def remove_stale_lock_files() -> list[Path]:
     """Remove OMERO repository lock files after OMERO.server has stopped."""
 
     removed: list[Path] = []
+    protected: list[Path] = []
     for lock_path in stale_lock_files():
-        lock_path.unlink()
-        removed.append(lock_path)
+        try:
+            lock_path.unlink()
+            removed.append(lock_path)
+        except PermissionError:
+            protected.append(lock_path)
+
+    remove_locks_with_root_helper(protected)
+    removed.extend(protected)
     return removed
 
 
