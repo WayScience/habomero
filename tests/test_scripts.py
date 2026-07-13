@@ -128,3 +128,27 @@ def test_safe_restart_removes_only_repository_locks(
     assert removed == [lock_path]
     assert not lock_path.exists()
     assert image_path.read_text(encoding="utf-8") == "pixels"
+
+
+def test_safe_restart_uses_root_helper_for_protected_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safe restart should handle lock files owned by container users."""
+
+    class ProtectedLock:
+        def unlink(self) -> None:
+            raise PermissionError("denied")
+
+    lock_path = ProtectedLock()
+    protected: list[Path] = []
+
+    def fake_root_helper(lock_paths: list[Path]) -> None:
+        protected.extend(lock_paths)
+
+    monkeypatch.setattr(safe_restart, "stale_lock_files", lambda: [lock_path])
+    monkeypatch.setattr(safe_restart, "remove_locks_with_root_helper", fake_root_helper)
+
+    removed = safe_restart.remove_stale_lock_files()
+
+    assert removed == [lock_path]
+    assert protected == [lock_path]
