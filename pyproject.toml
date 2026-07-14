@@ -1,6 +1,6 @@
 [build-system]
 build-backend = "setuptools.build_meta"
-requires = [ "setuptools>=64" ]
+requires = [ "setuptools>=83.0.0" ]
 
 [project]
 name = "habomero"
@@ -15,18 +15,18 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
-dependencies = [ "pyyaml>=6.0.2" ]
+dependencies = [ "pyyaml>=6.0.3" ]
 
 [dependency-groups]
 dev = [
-  "poethepoet>=0.34",
+  "poethepoet>=0.48.0",
   "pre-commit>=4.2",
-  "pytest>=8.3.5",
+  "pytest>=9.1.1",
 ]
 docs = [
-  "myst-nb>=1.2",
-  "pydata-sphinx-theme>=0.16.1",
-  "sphinx>=8.2.3",
+  "myst-nb>=1.4.0",
+  "pydata-sphinx-theme>=0.20.0",
+  "sphinx>=9.0.4",
 ]
 
 [tool.setuptools]
