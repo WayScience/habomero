@@ -124,6 +124,13 @@ uv run poe sync-users
 uv run poe backup
 ```
 
+- Safe recovery restart without deleting existing OMERO data:
+
+```bash
+uv run poe safe-restart
+uv run poe healthcheck
+```
+
 - Restore database from dump:
 
 ```bash

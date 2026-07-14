@@ -30,6 +30,22 @@ uv run poe logs
 All `poe` tasks must be run from the project root directory.
 `up` and the main `remote-run*` tasks also run `preflight` automatically.
 
+## Safe restart without deleting data
+
+Use this when recovering an existing OMERO stack after an unclean shutdown or
+stale repository lock warning. It preserves the existing database and OMERO
+repository data, creates a timestamped PostgreSQL backup under `data/backups`,
+stops only the OMERO application services, removes stale repository `.lock`
+files, and starts the stack again.
+
+```bash
+uv run poe safe-restart
+uv run poe healthcheck
+```
+
+This task does not remove Docker volumes, wipe `data/postgres`, or wipe
+`data/omero`.
+
 ## Continuous production ingest (full dataset)
 
 Start stack and run full-dataset parallel import:
