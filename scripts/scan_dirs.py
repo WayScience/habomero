@@ -13,10 +13,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
 STATE_PATH = PROJECT_ROOT / "data/state/scan_roots.yml"
 COMPOSE_OVERRIDE_PATH = PROJECT_ROOT / "data/state/scan_roots.compose.yml"
+RESERVED_GROUPS = {"user", "guest", "system"}
 
 
-def load_scan_directories() -> list[Path]:
-    """Load configured scan directories as resolved absolute paths."""
+def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR0912
+    """Load configured scan directories with optional per-root metadata."""
 
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"Scan directory config is missing: {CONFIG_PATH}")
@@ -27,12 +28,33 @@ def load_scan_directories() -> list[Path]:
     if not isinstance(raw_dirs, list):
         raise TypeError("scan_directories must be a YAML list")
 
-    resolved: list[Path] = []
+    resolved: list[dict[str, str]] = []
     for item in raw_dirs:
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError("scan_directories entries must be non-empty strings")
+        group = ""
+        if isinstance(item, str):
+            raw_path = item
+        elif isinstance(item, dict):
+            raw_path = item.get("path")
+            raw_group = item.get("group")
+            if raw_group is not None:
+                if not isinstance(raw_group, str) or not raw_group.strip():
+                    raise ValueError(
+                        "scan_directories group entries must be non-empty strings"
+                    )
+                group = raw_group.strip()
+                if group in RESERVED_GROUPS:
+                    raise ValueError(
+                        "scan_directories group entries must be non-reserved "
+                        "data groups (not one of: user, guest, system)"
+                    )
+        else:
+            raise ValueError(
+                "scan_directories entries must be non-empty strings or mappings"
+            )
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError("scan_directories path entries must be non-empty strings")
 
-        entry_path = Path(item).expanduser()
+        entry_path = Path(raw_path).expanduser()
         target = (
             entry_path.resolve()
             if entry_path.is_absolute()
@@ -40,21 +62,37 @@ def load_scan_directories() -> list[Path]:
         )
 
         if not allow_external and PROJECT_ROOT not in [target, *target.parents]:
-            raise ValueError(f"Path escapes project root: {item}")
+            raise ValueError(f"Path escapes project root: {raw_path}")
         if not target.exists() or not target.is_dir():
             raise FileNotFoundError(f"Scan directory does not exist: {target}")
 
-        resolved.append(target)
+        row = {"path": str(target)}
+        if group:
+            row["group"] = group
+        resolved.append(row)
 
     # De-duplicate and collapse nested paths so one file tree is scanned once.
-    unique_paths = sorted(set(resolved), key=lambda p: (len(p.parts), str(p)))
-    collapsed: list[Path] = []
-    for candidate in unique_paths:
-        if any(parent in [candidate, *candidate.parents] for parent in collapsed):
+    unique_entries = {
+        Path(row["path"]): row for row in sorted(resolved, key=lambda r: r["path"])
+    }
+    sorted_entries = sorted(
+        unique_entries.items(), key=lambda item: (len(item[0].parts), str(item[0]))
+    )
+    collapsed: list[dict[str, str]] = []
+    collapsed_paths: list[Path] = []
+    for candidate, row in sorted_entries:
+        if any(parent in [candidate, *candidate.parents] for parent in collapsed_paths):
             print(f"skip-overlap: {candidate}")
             continue
-        collapsed.append(candidate)
+        collapsed.append(row)
+        collapsed_paths.append(candidate)
     return collapsed
+
+
+def load_scan_directories() -> list[Path]:
+    """Load configured scan directories as resolved absolute paths."""
+
+    return [Path(row["path"]) for row in load_scan_directory_entries()]
 
 
 def root_key(path: Path) -> str:
@@ -64,13 +102,21 @@ def root_key(path: Path) -> str:
     return f"root_{digest}"
 
 
-def materialize_scan_roots(paths: list[Path]) -> dict[str, dict[str, str]]:
+def materialize_scan_roots(
+    paths: list[Path] | list[dict[str, str]],
+) -> dict[str, dict[str, str]]:
     """Build a root mapping and compose override for direct bind mounts."""
 
     mapping: dict[str, dict[str, str]] = {}
     volumes: list[str] = []
 
-    for source in paths:
+    for item in paths:
+        if isinstance(item, Path):
+            source = item
+            group = ""
+        else:
+            source = Path(item["path"])
+            group = item.get("group", "")
         key = root_key(source)
         container_root = f"/scan/roots/{key}"
 
@@ -78,6 +124,8 @@ def materialize_scan_roots(paths: list[Path]) -> dict[str, dict[str, str]]:
             "source": str(source),
             "container_root": container_root,
         }
+        if group:
+            mapping[key]["group"] = group
         volumes.append(f"{source}:{container_root}:ro")
 
     try:
@@ -125,7 +173,7 @@ def materialize_scan_roots(paths: list[Path]) -> dict[str, dict[str, str]]:
 def main() -> None:
     """Load, validate, and materialize scan roots for container mounts."""
 
-    directories = load_scan_directories()
+    directories = load_scan_directory_entries()
     mapping = materialize_scan_roots(directories)
     for key, data in sorted(mapping.items()):
         print(f"{key}: {data['source']}")

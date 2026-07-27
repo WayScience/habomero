@@ -9,7 +9,7 @@ REQUIRED_PATHS = [
     Path("ansible/playbook.yml"),
     Path(".env.example"),
     Path("config/omero/scan_dirs.yml"),
-    Path("config/omero/users.yml"),
+    Path("config/omero/users.example.yml"),
     Path("data"),
 ]
 

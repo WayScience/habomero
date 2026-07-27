@@ -2,6 +2,8 @@ allow_external_paths: true
 scan_directories:
   - ~/mnt/bandicoot/RxRx19a
   - ~/mnt/bandicoot/CFReT_subtyping_data
+  - path: ~/mnt/Way_McKinsey_Cardiac_Fibrosis
+    group: way_mckinsey_cardiac_fibrosis
 
 # Optional shared OMERO group for imports. All configured users are joined
 # to this group by sync-users, and imports use this group context.
@@ -17,6 +19,11 @@ omero_folder_root: scan-root
 # - copy: duplicate image data into OMERO managed storage
 # - inplace: keep data at source path and import by reference (no duplication)
 import_mode: inplace
+
+# When true, imported OMERO Images are deleted if their source files are no
+# longer found during a successful scan of the configured source root. Source
+# files are never deleted by this cleanup.
+delete_omero_missing_files: true
 
 # Safety controls for high-latency/remote sources:
 # Maximum number of files to attempt in a single import-scan run.

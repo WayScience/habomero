@@ -44,9 +44,12 @@ def main() -> None:
     """Emit access URLs for OMERO.web."""
 
     port = read_env_var("OMERO_WEB_PORT", "4080")
+    public_hostname = read_env_var("OMERO_PUBLIC_HOSTNAME", "").strip()
     host_ip = get_local_ip()
     print(f"OMERO.web local:    http://localhost:{port}/webclient/")
     print(f"OMERO.web network:  http://{host_ip}:{port}/webclient/")
+    if public_hostname:
+        print(f"OMERO.web hostname: http://{public_hostname}:{port}/webclient/")
 
 
 if __name__ == "__main__":

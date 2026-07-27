@@ -264,21 +264,21 @@ def ensure_default_group(
     )
 
 
-def ensure_user(root_password: str, user: dict[str, str]) -> None:
+def ensure_user(root_password: str, user: dict[str, object]) -> None:
     """Create user if missing and ensure group membership is present."""
 
-    username = user["username"]
-    group = user["group"]
+    username = str(user["username"])
+    group = str(user["group"])
     ensure_group(root_password, group)
 
     if not user_exists(root_password, username):
         username_q = shlex.quote(username)
-        first_q = shlex.quote(user["first_name"])
-        last_q = shlex.quote(user["last_name"])
+        first_q = shlex.quote(str(user["first_name"]))
+        last_q = shlex.quote(str(user["last_name"]))
         group_q = shlex.quote(group)
-        email_q = shlex.quote(user["email"])
-        institution_q = shlex.quote(user["institution"])
-        password_q = shlex.quote(user.get("password", "changeme123"))
+        email_q = shlex.quote(str(user["email"]))
+        institution_q = shlex.quote(str(user["institution"]))
+        password_q = shlex.quote(str(user.get("password", "changeme123")))
         add_cmd = (
             "omero user add "
             f"{username_q} "
@@ -298,7 +298,7 @@ def ensure_user(root_password: str, user: dict[str, str]) -> None:
     else:
         print(f"exists: {username}")
 
-    password = user.get("password", "")
+    password = str(user.get("password", ""))
     if password and not user_exists(root_password, username):
         passwd_commands = [
             f"omero user password --user-name {username} {password}",
@@ -317,9 +317,27 @@ def ensure_user(root_password: str, user: dict[str, str]) -> None:
             print(f"password-unchanged: {username} ({last_error})")
 
     ensure_user_group_membership(root_password, username, group)
+    for extra_group in user.get("extra_groups", []):
+        extra_group_name = str(extra_group)
+        ensure_group(root_password, extra_group_name)
+        ensure_user_group_membership(root_password, username, extra_group_name)
 
 
-def load_users() -> list[dict[str, str]]:  # noqa: C901
+def resolve_user_password(item: dict[str, object]) -> str | None:
+    """Read an optional OMERO user password from config or an env var."""
+
+    password = item.get("password")
+    if isinstance(password, str) and password.strip():
+        return password.strip()
+
+    password_env = item.get("password_env")
+    if isinstance(password_env, str) and password_env.strip():
+        return read_env_var(password_env.strip())
+
+    return None
+
+
+def load_users() -> list[dict[str, object]]:  # noqa: C901, PLR0912, PLR0915
     """Load and validate user allowlist entries from YAML."""
 
     if not CONFIG_PATH.exists():
@@ -339,7 +357,7 @@ def load_users() -> list[dict[str, str]]:  # noqa: C901
         "institution",
     }
 
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, object]] = []
     for item in users:
         if not isinstance(item, dict):
             raise UserConfigError("Each user entry must be a mapping")
@@ -348,7 +366,7 @@ def load_users() -> list[dict[str, str]]:  # noqa: C901
         if missing:
             raise UserConfigError(f"Missing required user fields: {', '.join(missing)}")
 
-        row: dict[str, str] = {}
+        row: dict[str, object] = {}
         for key in required:
             value = item[key]
             if not isinstance(value, str) or not value.strip():
@@ -360,13 +378,47 @@ def load_users() -> list[dict[str, str]]:  # noqa: C901
                 "(not one of: user, guest, system)"
             )
 
-        if "password" in item:
-            password = item["password"]
-            if not isinstance(password, str) or not password.strip():
+        has_password = "password" in item
+        has_password_env = "password_env" in item
+        if has_password and has_password_env:
+            raise UserConfigError(
+                "User entries must define only one of 'password' or 'password_env'"
+            )
+        if has_password or has_password_env:
+            try:
+                password = resolve_user_password(item)
+            except UserConfigError:
+                raise
+            if not password:
                 raise UserConfigError(
-                    "User field 'password' must be a non-empty string"
+                    "User entries must define password or password_env"
                 )
-            row["password"] = password.strip()
+            row["password"] = password
+
+        extra_groups = item.get("extra_groups", [])
+        if extra_groups is None:
+            extra_groups = []
+        if not isinstance(extra_groups, list):
+            raise UserConfigError("User field 'extra_groups' must be a YAML list")
+        normalized_extra_groups: list[str] = []
+        for group in extra_groups:
+            if not isinstance(group, str) or not group.strip():
+                raise UserConfigError(
+                    "User field 'extra_groups' entries must be non-empty strings"
+                )
+            normalized_group = group.strip()
+            if normalized_group in RESERVED_GROUPS:
+                raise UserConfigError(
+                    "User field 'extra_groups' must contain non-reserved data "
+                    "groups (not one of: user, guest, system)"
+                )
+            normalized_extra_groups.append(normalized_group)
+        row["extra_groups"] = normalized_extra_groups
+
+        join_shared_group = item.get("join_shared_group", True)
+        if not isinstance(join_shared_group, bool):
+            raise UserConfigError("User field 'join_shared_group' must be a boolean")
+        row["join_shared_group"] = join_shared_group
 
         normalized.append(row)
 
@@ -422,10 +474,16 @@ def main() -> None:
         ensure_group_permissions(root_password, shared_group, shared_group_permissions)
     for user in users:
         ensure_user(root_password, user)
-        ensure_default_group(root_password, user["username"], user["group"])
-        if shared_group and user["group"] != shared_group:
-            ensure_user_group_membership(root_password, user["username"], shared_group)
-            ensure_default_group(root_password, user["username"], shared_group)
+        username = str(user["username"])
+        primary_group = str(user["group"])
+        ensure_default_group(root_password, username, primary_group)
+        if (
+            shared_group
+            and primary_group != shared_group
+            and user.get("join_shared_group", True)
+        ):
+            ensure_user_group_membership(root_password, username, shared_group)
+            ensure_default_group(root_password, username, shared_group)
 
 
 if __name__ == "__main__":
