@@ -1,0 +1,25 @@
+users:
+  - username: habomero
+    first_name: Habomero
+    last_name: Service
+    group: lab
+    extra_groups:
+      - way_mckinsey_cardiac_fibrosis
+    email: habomero@example.org
+    institution: Local Lab
+    password_env: OMERO_USER_HABOMERO_PASSWORD
+  - username: test
+    first_name: Test
+    last_name: User
+    group: lab
+    email: test@example.org
+    institution: Local Lab
+    password_env: OMERO_USER_TEST_PASSWORD
+  - username: way_mckinsey
+    first_name: Way McKinsey
+    last_name: Cardiac Fibrosis
+    group: way_mckinsey_cardiac_fibrosis
+    join_shared_group: false
+    email: way_mckinsey@example.org
+    institution: Local Lab
+    password_env: OMERO_USER_WAY_MCKINSEY_PASSWORD

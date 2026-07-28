@@ -15,6 +15,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 USERS_CONFIG_PATH = PROJECT_ROOT / "config/omero/users.yml"
 SCAN_CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
+ENV_PATH = PROJECT_ROOT / ".env"
 SCAN_ROOTS_STATE_PATH = PROJECT_ROOT / "data/state/scan_roots.yml"
 IMPORT_STATE_PATH = PROJECT_ROOT / "data/state/imported_files.txt"
 DATASET_STATE_PATH = PROJECT_ROOT / "data/state/path_datasets.yml"
@@ -47,6 +48,37 @@ IMPORT_WORKERS = 1
 
 class ImportConfigError(ValueError):
     """Raised for invalid import configuration."""
+
+
+def read_env_var(name: str) -> str:
+    """Read a required variable from process env or local .env file."""
+
+    if value := os.getenv(name):
+        return value
+
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw = line.split("=", maxsplit=1)
+            if key.strip() == name:
+                return raw.strip()
+
+    raise ImportConfigError(f"Missing required environment variable: {name}")
+
+
+def user_password(item: dict[str, object]) -> str:
+    """Read an OMERO user password from a literal or configured env var."""
+
+    password = item.get("password")
+    if isinstance(password, str) and password.strip():
+        return password.strip()
+
+    password_env = item.get("password_env")
+    if isinstance(password_env, str) and password_env.strip():
+        return read_env_var(password_env.strip())
+
+    raise ImportConfigError("Each user needs password or password_env")
 
 
 def positive_int(payload: dict[str, object], key: str, default: int) -> int:
@@ -97,17 +129,16 @@ def load_user_credentials() -> tuple[dict[str, str], str]:
         if not isinstance(item, dict):
             raise ImportConfigError("Each user entry must be a mapping")
         username = str(item.get("username", "")).strip()
-        password = str(item.get("password", "")).strip()
-        if not username or not password:
-            raise ImportConfigError("Each user needs username and password")
-        credentials[username] = password
+        if not username:
+            raise ImportConfigError("Each user needs username")
+        credentials[username] = user_password(item)
         if index == 0:
             first_username = username
     return credentials, first_username
 
 
 def load_import_config(  # noqa: C901, PLR0912, PLR0915
-) -> tuple[str, str, str, int, int, int, int, int, int, int, int]:
+) -> tuple[str, str, str, int, int, int, int, int, int, int, int, bool]:
     shared_group = ""
     root_prefix = "scan-root"
     import_mode = "copy"
@@ -119,6 +150,7 @@ def load_import_config(  # noqa: C901, PLR0912, PLR0915
     scan_progress_every_paths = SCAN_PROGRESS_EVERY_PATHS
     import_progress_every_files = IMPORT_PROGRESS_EVERY_FILES
     import_workers = IMPORT_WORKERS
+    delete_omero_missing_files = False
     if SCAN_CONFIG_PATH.exists():
         payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
         group = payload.get("shared_group")
@@ -164,6 +196,12 @@ def load_import_config(  # noqa: C901, PLR0912, PLR0915
             import_progress_every_files,
         )
         import_workers = positive_int(payload, "import_workers", import_workers)
+        delete_missing_value = payload.get(
+            "delete_omero_missing_files",
+            payload.get("delete_missing_files"),
+        )
+        if isinstance(delete_missing_value, bool):
+            delete_omero_missing_files = delete_missing_value
     env_cap = os.environ.get("IMPORT_MAX_FILES_PER_RUN", "").strip()
     if env_cap:
         try:
@@ -236,6 +274,7 @@ def load_import_config(  # noqa: C901, PLR0912, PLR0915
         scan_progress_every_paths,
         import_progress_every_files,
         import_workers,
+        delete_omero_missing_files,
     )
 
 
@@ -294,8 +333,11 @@ def load_scan_roots() -> dict[str, dict[str, str]]:
         if isinstance(key, str) and isinstance(value, dict):
             source = value.get("source")
             container_root = value.get("container_root")
+            group = value.get("group")
             if isinstance(source, str) and isinstance(container_root, str):
                 result[key] = {"source": source, "container_root": container_root}
+                if isinstance(group, str) and group.strip():
+                    result[key]["group"] = group.strip()
     return result
 
 
@@ -604,6 +646,117 @@ def load_dataset_image_names(
     return names
 
 
+def hql_string(value: str) -> str:
+    """Quote a string literal for the simple HQL queries used by this script."""
+
+    return "'" + value.replace("'", "''") + "'"
+
+
+def load_dataset_image_ids_by_name(
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    dataset_id: int,
+    image_name: str,
+) -> list[int]:
+    """Load image IDs in a dataset matching an imported source filename."""
+
+    cmd = (
+        "omero hql "
+        f'"select i.id from Image i join i.datasetLinks l '
+        f'where l.parent.id = {dataset_id} and i.name = {hql_string(image_name)}"'
+    )
+    result = run_as_user_with_retry(owner, owner_password, cmd, shared_group)
+    if result.returncode != 0:
+        return []
+
+    ids: list[int] = []
+    for match in re.finditer(r"\[(\d+)\]", result.stdout):
+        ids.append(int(match.group(1)))
+    return ids
+
+
+def delete_image(
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    image_id: int,
+) -> bool:
+    """Delete a single OMERO image and wait for deletion completion."""
+
+    result = run_as_user_with_retry(
+        owner,
+        owner_password,
+        f"omero delete Image:{image_id} -w --no-wait",
+        shared_group,
+    )
+    return result.returncode == 0
+
+
+def delete_missing_imports(  # noqa: PLR0913
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    root_key: str,
+    container_root: str,
+    root_files: set[str],
+    imported: set[str],
+    dataset_state: dict[str, int],
+) -> int:
+    """Remove OMERO images whose source files disappeared from a scanned root."""
+
+    deleted = 0
+    root_prefix = f"{root_key}:"
+    stale_tracking_keys = sorted(
+        key
+        for key in imported
+        if (
+            key.startswith(root_prefix)
+            and key.removeprefix(root_prefix) not in root_files
+        )
+    )
+    if not stale_tracking_keys:
+        return 0
+
+    print(f"[cleanup] stale tracked files={len(stale_tracking_keys)} for {root_key}")
+    for tracking_key in stale_tracking_keys:
+        abs_path = tracking_key.removeprefix(root_prefix)
+        rel_path = rel_path_from_root(abs_path, container_root)
+        rel_dir = dataset_key_for_rel_path(rel_path)
+        dataset_id = dataset_state.get(f"{root_key}|{rel_dir}")
+        if dataset_id is None:
+            imported.remove(tracking_key)
+            deleted += 1
+            continue
+
+        image_ids = load_dataset_image_ids_by_name(
+            owner,
+            owner_password,
+            shared_group,
+            dataset_id,
+            Path(abs_path).name,
+        )
+        if not image_ids:
+            imported.remove(tracking_key)
+            deleted += 1
+            print(f"[cleanup-missing] {rel_path}: no OMERO image found")
+            continue
+
+        deleted_all = True
+        for image_id in image_ids:
+            if delete_image(owner, owner_password, shared_group, image_id):
+                print(f"[cleanup-deleted] {rel_path} -> Image:{image_id}")
+            else:
+                print(f"[cleanup-failed] {rel_path} -> Image:{image_id}")
+                deleted_all = False
+        if deleted_all:
+            imported.remove(tracking_key)
+            deleted += 1
+    if deleted:
+        save_string_set(IMPORT_STATE_PATH, imported)
+    return deleted
+
+
 def build_import_command(import_mode: str, dataset_id: int, abs_path: str) -> str:
     """Build OMERO import command for configured transfer mode."""
 
@@ -747,6 +900,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     scan_progress_every_paths: int,
     import_progress_every_files: int,
     import_workers: int,
+    delete_omero_missing_files: bool,
 ) -> tuple[int, dict[str, str], bool, dict[str, int]]:
     """Import files for a single root. Returns count, failures, hit_cap."""
 
@@ -754,6 +908,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     budget_capped = budget_remaining > 0
     skipped_existing_count = 0
     skipped_tracked_count = 0
+    deleted_missing_count = 0
     failures: dict[str, str] = {}
     dataset_image_cache: dict[int, set[str]] = {}
     root_files: list[str] | None = None
@@ -783,12 +938,25 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 "queued": 0,
                 "skipped_tracked": 0,
                 "skipped_existing": 0,
+                "deleted_missing": 0,
             },
         )
     print(
         f"[root] {source_root}: candidate files={len(root_files)} "
         f"budget={budget_remaining if budget_capped else 'uncapped'}"
     )
+    root_file_set = set(root_files)
+    if delete_omero_missing_files:
+        deleted_missing_count = delete_missing_imports(
+            owner,
+            owner_password,
+            shared_group,
+            root_key,
+            container_root,
+            root_file_set,
+            imported,
+            dataset_state,
+        )
 
     # Build worklist serially so dataset/project bookkeeping stays consistent.
     work: list[tuple[str, int]] = []
@@ -804,6 +972,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     "queued": len(work),
                     "skipped_tracked": skipped_tracked_count,
                     "skipped_existing": skipped_existing_count,
+                    "deleted_missing": deleted_missing_count,
                 },
             )
         tracking_key = f"{root_key}:{abs_path}"
@@ -872,6 +1041,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                             "queued": len(work),
                             "skipped_tracked": skipped_tracked_count,
                             "skipped_existing": skipped_existing_count,
+                            "deleted_missing": deleted_missing_count,
                         },
                     )
                 continue
@@ -895,6 +1065,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 "queued": len(work),
                 "skipped_tracked": skipped_tracked_count,
                 "skipped_existing": skipped_existing_count,
+                "deleted_missing": deleted_missing_count,
             },
         )
 
@@ -935,6 +1106,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                             "queued": len(work),
                             "skipped_tracked": skipped_tracked_count,
                             "skipped_existing": skipped_existing_count,
+                            "deleted_missing": deleted_missing_count,
                         },
                     )
                 continue
@@ -956,6 +1128,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
             "queued": len(work),
             "skipped_tracked": skipped_tracked_count,
             "skipped_existing": skipped_existing_count,
+            "deleted_missing": deleted_missing_count,
         },
     )
 
@@ -975,6 +1148,7 @@ def import_files() -> None:  # noqa: PLR0915
         scan_progress_every_paths,
         import_progress_every_files,
         import_workers,
+        delete_omero_missing_files,
     ) = load_import_config()
     wait_for_db_stable(db_stable_checks, db_stable_interval)
 
@@ -995,18 +1169,22 @@ def import_files() -> None:  # noqa: PLR0915
     total_queued = 0
     total_skipped_tracked = 0
     total_skipped_existing = 0
+    total_deleted_missing = 0
     interrupted = False
     try:
         for root_key, root_data in sorted(roots.items()):
             source = root_data["source"]
             container_root = root_data["container_root"]
+            root_group = root_data.get("group", shared_group)
             print(f"[root-begin] {root_key} source={source}")
             print(f"[root-begin] {root_key} container_root={container_root}")
+            if root_group:
+                print(f"[root-begin] {root_key} group={root_group}")
             try:
                 project_id = get_or_create_project(
                     owner,
                     owner_password,
-                    shared_group,
+                    root_group,
                     root_key,
                     root_prefix,
                     source,
@@ -1022,7 +1200,7 @@ def import_files() -> None:  # noqa: PLR0915
             root_imported, root_failures, hit_cap, root_stats = import_root_files(
                 owner,
                 owner_password,
-                shared_group,
+                root_group,
                 import_mode,
                 root_key,
                 source,
@@ -1036,6 +1214,7 @@ def import_files() -> None:  # noqa: PLR0915
                 scan_progress_every_paths,
                 import_progress_every_files,
                 import_workers,
+                delete_omero_missing_files,
             )
             imported_count += root_imported
             failures.update(root_failures)
@@ -1043,13 +1222,15 @@ def import_files() -> None:  # noqa: PLR0915
             total_queued += root_stats["queued"]
             total_skipped_tracked += root_stats["skipped_tracked"]
             total_skipped_existing += root_stats["skipped_existing"]
+            total_deleted_missing += root_stats["deleted_missing"]
             print(
                 f"[root-end] {root_key} imported_this_root={root_imported} "
                 f"failures_this_root={len(root_failures)} "
                 f"candidates={root_stats['candidates']} "
                 f"queued={root_stats['queued']} "
                 f"skipped_tracked={root_stats['skipped_tracked']} "
-                f"skipped_existing={root_stats['skipped_existing']}"
+                f"skipped_existing={root_stats['skipped_existing']} "
+                f"deleted_missing={root_stats['deleted_missing']}"
             )
             # Checkpoint state per root so restart can't replay completed root work.
             save_string_set(IMPORT_STATE_PATH, imported)
@@ -1072,7 +1253,8 @@ def import_files() -> None:  # noqa: PLR0915
         f"candidates={total_candidates} queued={total_queued} "
         f"imported_new={imported_count} skipped_tracked={total_skipped_tracked} "
         f"skipped_existing={total_skipped_existing} failures={len(failures)} "
-        f"tracked_before={imported_before} tracked_after={imported_after}"
+        f"deleted_missing={total_deleted_missing} tracked_before={imported_before} "
+        f"tracked_after={imported_after}"
     )
     if interrupted:
         return
