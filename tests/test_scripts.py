@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,39 @@ def test_scan_dirs_materializes_per_root_group(
     assert next(iter(mapping.values()))["group"] == "way_mckinsey_cardiac_fibrosis"
 
 
+def test_scan_dirs_materializes_per_root_import_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mapping entries can attach an explicit import owner to a scan root."""
+
+    project_root = tmp_path / "project"
+    source = project_root / "cardiac"
+    source.mkdir(parents=True)
+    config_path = project_root / "scan_dirs.yml"
+    state_path = project_root / "state.yml"
+    compose_path = project_root / "compose.yml"
+    config_path.write_text(
+        "scan_directories:\n  - path: cardiac\n    import_user: habomero\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(scan_dirs, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(scan_dirs, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(scan_dirs, "STATE_PATH", state_path)
+    monkeypatch.setattr(scan_dirs, "COMPOSE_OVERRIDE_PATH", compose_path)
+
+    entries = scan_dirs.load_scan_directory_entries()
+    mapping = scan_dirs.materialize_scan_roots(entries)
+
+    assert entries == [
+        {
+            "path": str(source.resolve()),
+            "import_user": "habomero",
+        }
+    ]
+    assert next(iter(mapping.values()))["import_user"] == "habomero"
+
+
 def test_sync_users_loads_shared_group_opt_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -152,6 +186,71 @@ def test_sync_users_loads_shared_group_opt_out(
 
     assert users[0]["join_shared_group"] is False
     assert users[0]["extra_groups"] == []
+
+
+def test_sync_users_does_not_join_shared_group_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shared group visibility is opt-in for non-primary-group users."""
+
+    config_path = tmp_path / "users.yml"
+    config_path.write_text(
+        "users:\n"
+        "  - username: viewer\n"
+        "    first_name: View\n"
+        "    last_name: User\n"
+        "    group: restricted\n"
+        "    email: viewer@example.org\n"
+        "    institution: Local Lab\n"
+        "    password: viewer\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(sync_users, "CONFIG_PATH", config_path)
+
+    users = sync_users.load_users()
+
+    assert users[0]["join_shared_group"] is False
+
+
+def test_sync_users_group_absence_removes_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opted-out users are removed from an old shared-group membership."""
+
+    commands: list[str] = []
+
+    def fake_run(root_password: str, command: str) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(sync_users, "run_in_omero_with_retry", fake_run)
+
+    sync_users.ensure_user_group_absence("root-password", "viewer", "lab")
+
+    assert commands == ["omero user leavegroup lab --name=viewer"]
+
+
+def test_sync_users_loads_scan_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-root scan groups are discovered for sync and permissions."""
+
+    config_path = tmp_path / "scan_dirs.yml"
+    config_path.write_text(
+        "scan_directories:\n"
+        "  - path: a\n"
+        "    group: rxrx19a\n"
+        "  - path: b\n"
+        "    group: cfret_subtyping_data\n"
+        "scan_group_permissions: read-annotate\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(sync_users, "SCAN_CONFIG_PATH", config_path)
+
+    assert sync_users.load_scan_groups() == {"rxrx19a", "cfret_subtyping_data"}
+    assert sync_users.load_scan_group_permissions() == "read-annotate"
 
 
 def test_sync_users_loads_password_from_env(
@@ -206,10 +305,19 @@ def test_delete_missing_imports_removes_deleted_image_tracking(
     """Stale source files are deleted from OMERO and removed from state."""
 
     state_path = tmp_path / "imported_files.txt"
+    keep_key = import_scan.imported_file_key(
+        "root_a", "habomero", "lab", "/scan/roots/root_a/keep.tif"
+    )
+    missing_key = import_scan.imported_file_key(
+        "root_a", "habomero", "lab", "/scan/roots/root_a/missing.tif"
+    )
+    other_key = import_scan.imported_file_key(
+        "root_b", "habomero", "lab", "/scan/roots/root_b/other.tif"
+    )
     imported = {
-        "root_a:/scan/roots/root_a/keep.tif",
-        "root_a:/scan/roots/root_a/missing.tif",
-        "root_b:/scan/roots/root_b/other.tif",
+        keep_key,
+        missing_key,
+        other_key,
     }
     deleted_ids: list[int] = []
 
@@ -239,14 +347,14 @@ def test_delete_missing_imports_removes_deleted_image_tracking(
         "/scan/roots/root_a",
         {"/scan/roots/root_a/keep.tif"},
         imported,
-        {"root_a|root": 99},
+        {"root_a|owner=habomero|group=lab|root": 99},
     )
 
     assert deleted == 1
     assert deleted_ids == [123]
     assert imported == {
-        "root_a:/scan/roots/root_a/keep.tif",
-        "root_b:/scan/roots/root_b/other.tif",
+        keep_key,
+        other_key,
     }
     assert state_path.read_text(encoding="utf-8").splitlines() == sorted(imported)
 
@@ -264,6 +372,54 @@ def test_import_config_loads_explicit_omero_delete_flag(
     config = import_scan.load_import_config()
 
     assert config[-1] is True
+
+
+def test_import_config_loads_default_import_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default import owner can be configured explicitly."""
+
+    config_path = tmp_path / "scan_dirs.yml"
+    config_path.write_text("import_user: habomero\n", encoding="utf-8")
+
+    monkeypatch.setattr(import_scan, "SCAN_CONFIG_PATH", config_path)
+
+    assert import_scan.load_default_import_user() == "habomero"
+
+
+def test_import_config_loads_legacy_reimport_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy imported-file state reprocessing requires an explicit flag."""
+
+    config_path = tmp_path / "scan_dirs.yml"
+    config_path.write_text("reimport_legacy_import_state: true\n", encoding="utf-8")
+
+    monkeypatch.setattr(import_scan, "SCAN_CONFIG_PATH", config_path)
+
+    assert import_scan.load_reimport_legacy_import_state() is True
+
+
+def test_import_state_keys_include_owner_and_group() -> None:
+    """Project/dataset state is scoped to avoid reusing old ownership."""
+
+    assert (
+        import_scan.state_scope_key("root_a", "habomero", "lab")
+        == "root_a|owner=habomero|group=lab"
+    )
+    assert (
+        import_scan.imported_file_key(
+            "root_a",
+            "habomero",
+            "lab",
+            "/scan/roots/root_a/image.tif",
+        )
+        == "root_a|owner=habomero|group=lab:/scan/roots/root_a/image.tif"
+    )
+    assert (
+        import_scan.legacy_imported_file_key("root_a", "/scan/roots/root_a/image.tif")
+        == "root_a:/scan/roots/root_a/image.tif"
+    )
 
 
 def test_safe_restart_compose_args_include_scan_roots_when_present(

@@ -131,11 +131,21 @@ Then synchronize those users into OMERO:
 uv run poe sync-users
 ```
 
-Users are joined to `shared_group` by default when it is configured in
-`config/omero/scan_dirs.yml`. Set `join_shared_group: false` for a restricted
-account, and use `extra_groups` for service/import users that need access to
-per-root import groups. A scan directory entry may be a mapping with `path` and
-`group` to import that root into a separate OMERO group.
+Configure each real data root with its own per-root `group` so images are not
+shared with all users by default. Imports without a per-root `group` use
+`shared_group` when it is configured in `config/omero/scan_dirs.yml`. Users are
+not joined to that group by default; set `join_shared_group: true` only for
+users who should see fallback shared content. Use `extra_groups` for
+service/import users that need access to per-root import groups.
+`sync-users` creates scan root groups and applies `scan_group_permissions`.
+Set top-level `import_user: habomero` to keep imported projects owned by one
+service account in OMERO.web. Use per-root `group` values for access control;
+only use per-root `import_user` when that root should appear under a different
+OMERO owner.
+With `reimport_legacy_import_state: true`, files tracked by an older owner/group
+state format are rechecked and imported into the current configured owner/group.
+This repopulates the desired OMERO location after config changes; it does not
+delete old OMERO objects that were already imported elsewhere.
 
 ## Backup
 

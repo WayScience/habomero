@@ -4,6 +4,8 @@ users:
     last_name: Service
     group: lab
     extra_groups:
+      - rxrx19a
+      - cfret_subtyping_data
       - way_mckinsey_cardiac_fibrosis
     email: habomero@example.org
     institution: Local Lab
@@ -11,7 +13,7 @@ users:
   - username: test
     first_name: Test
     last_name: User
-    group: lab
+    group: test_private
     email: test@example.org
     institution: Local Lab
     password_env: OMERO_USER_TEST_PASSWORD

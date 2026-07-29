@@ -1,16 +1,25 @@
 allow_external_paths: true
 scan_directories:
-  - ~/mnt/bandicoot/RxRx19a
-  - ~/mnt/bandicoot/CFReT_subtyping_data
+  - path: ~/mnt/bandicoot/RxRx19a
+    group: rxrx19a
+  - path: ~/mnt/bandicoot/CFReT_subtyping_data
+    group: cfret_subtyping_data
   - path: ~/mnt/Way_McKinsey_Cardiac_Fibrosis
     group: way_mckinsey_cardiac_fibrosis
 
-# Optional shared OMERO group for imports. All configured users are joined
-# to this group by sync-users, and imports use this group context.
+# Optional fallback OMERO group for scan roots that do not define a per-root
+# group. Users are not automatically joined to this group unless their users.yml
+# entry sets join_shared_group: true.
 shared_group: lab
+# Default OMERO owner used for imports. Keeping one import owner makes OMERO.web
+# show imported projects under one user in "All Users"; per-root groups still
+# control which users can see each root.
+import_user: habomero
 # Optional permission profile applied to shared_group by sync-users.
 # Typical value for collaboration visibility: read-annotate
 shared_group_permissions: read-annotate
+# Optional permission profile applied to each per-root scan directory group.
+scan_group_permissions: read-annotate
 
 # Optional root folder name in OMERO for mirrored filesystem hierarchy.
 omero_folder_root: scan-root
@@ -24,6 +33,10 @@ import_mode: inplace
 # longer found during a successful scan of the configured source root. Source
 # files are never deleted by this cleanup.
 delete_omero_missing_files: true
+# When true, files tracked by the old unscoped imported_files.txt format are
+# rechecked/reimported under the current owner/group config so placement config
+# changes can repopulate the configured OMERO location.
+reimport_legacy_import_state: true
 
 # Safety controls for high-latency/remote sources:
 # Maximum number of files to attempt in a single import-scan run.

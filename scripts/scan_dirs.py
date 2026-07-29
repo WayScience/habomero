@@ -16,7 +16,7 @@ COMPOSE_OVERRIDE_PATH = PROJECT_ROOT / "data/state/scan_roots.compose.yml"
 RESERVED_GROUPS = {"user", "guest", "system"}
 
 
-def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR0912
+def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR0912, PLR0915
     """Load configured scan directories with optional per-root metadata."""
 
     if not CONFIG_PATH.exists():
@@ -31,11 +31,13 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
     resolved: list[dict[str, str]] = []
     for item in raw_dirs:
         group = ""
+        import_user = ""
         if isinstance(item, str):
             raw_path = item
         elif isinstance(item, dict):
             raw_path = item.get("path")
             raw_group = item.get("group")
+            raw_import_user = item.get("import_user")
             if raw_group is not None:
                 if not isinstance(raw_group, str) or not raw_group.strip():
                     raise ValueError(
@@ -47,6 +49,12 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
                         "scan_directories group entries must be non-reserved "
                         "data groups (not one of: user, guest, system)"
                     )
+            if raw_import_user is not None:
+                if not isinstance(raw_import_user, str) or not raw_import_user.strip():
+                    raise ValueError(
+                        "scan_directories import_user entries must be non-empty strings"
+                    )
+                import_user = raw_import_user.strip()
         else:
             raise ValueError(
                 "scan_directories entries must be non-empty strings or mappings"
@@ -69,6 +77,8 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
         row = {"path": str(target)}
         if group:
             row["group"] = group
+        if import_user:
+            row["import_user"] = import_user
         resolved.append(row)
 
     # De-duplicate and collapse nested paths so one file tree is scanned once.
@@ -114,9 +124,11 @@ def materialize_scan_roots(
         if isinstance(item, Path):
             source = item
             group = ""
+            import_user = ""
         else:
             source = Path(item["path"])
             group = item.get("group", "")
+            import_user = item.get("import_user", "")
         key = root_key(source)
         container_root = f"/scan/roots/{key}"
 
@@ -126,6 +138,8 @@ def materialize_scan_roots(
         }
         if group:
             mapping[key]["group"] = group
+        if import_user:
+            mapping[key]["import_user"] = import_user
         volumes.append(f"{source}:{container_root}:ro")
 
     try:

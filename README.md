@@ -152,20 +152,30 @@ uv run poe run
 scan directory (`OMERO_SCAN_DIR` -> `/scan/inbox`) using the first user in
 `config/omero/users.yml`.
 Imports mirror directory hierarchy in OMERO Folders (folders map to folders,
-images map to images). If `shared_group` is set in `config/omero/scan_dirs.yml`,
-configured users are joined to that group by default and imported content is
-visible to all group members. Set `join_shared_group: false` on restricted
-users that should not see shared content. Set `import_mode: inplace` in
+images map to images). Configure each real data root with its own per-root
+`group` so images are not shared with all users by default. If `shared_group` is
+set in `config/omero/scan_dirs.yml`, only roots without a per-root `group` use
+that fallback group. Users are not joined to the shared group by default; set
+`join_shared_group: true` only for users who should see fallback shared content.
+Set `import_mode: inplace` in
 `config/omero/scan_dirs.yml` to avoid duplicate storage by importing file
 references instead of copying pixel data.
 `config/omero/users.yml` is local-only and ignored by Git; commit changes to
 `config/omero/users.example.yml` instead, and use `password_env` entries with
 real password values in `.env`.
-Scan roots may also be configured as mappings with `path` and `group`; imports
-for that root run in the configured OMERO group instead of the global shared
-group. Set `delete_omero_missing_files: true` to delete tracked OMERO Images
+Scan root `group` values are created by `sync-users` with
+`scan_group_permissions` so the import owner and intended group members can see
+the data. Set `delete_omero_missing_files: true` to delete tracked OMERO Images
 when their source files are no longer present after a successful source-root
 scan. This only deletes OMERO records, not source files.
+Set top-level `import_user: habomero` to keep imported projects owned by one
+service account in OMERO.web. Per-root `group` values still control visibility;
+per-root `import_user` may be used only when a root should appear under a
+different OMERO owner.
+With `reimport_legacy_import_state: true`, files tracked by an older owner/group
+state format are rechecked and imported into the current configured location.
+This repopulates the desired OMERO owner/group after config changes; it does not
+delete old OMERO objects that were already imported elsewhere.
 
 - Production-style full-dataset parallel ingest with periodic rescan:
 

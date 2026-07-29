@@ -278,6 +278,28 @@ def load_import_config(  # noqa: C901, PLR0912, PLR0915
     )
 
 
+def load_default_import_user() -> str:
+    """Load optional default OMERO user for all imports."""
+
+    if not SCAN_CONFIG_PATH.exists():
+        return ""
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    import_user = payload.get("import_user")
+    if isinstance(import_user, str) and import_user.strip():
+        return import_user.strip()
+    return ""
+
+
+def load_reimport_legacy_import_state() -> bool:
+    """Load whether old unscoped imported-file state should trigger reimport."""
+
+    if not SCAN_CONFIG_PATH.exists():
+        return False
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    value = payload.get("reimport_legacy_import_state")
+    return value is True
+
+
 def is_db_healthy() -> bool:
     """Check postgres health from compose metadata."""
 
@@ -334,10 +356,13 @@ def load_scan_roots() -> dict[str, dict[str, str]]:
             source = value.get("source")
             container_root = value.get("container_root")
             group = value.get("group")
+            import_user = value.get("import_user")
             if isinstance(source, str) and isinstance(container_root, str):
                 result[key] = {"source": source, "container_root": container_root}
                 if isinstance(group, str) and group.strip():
                     result[key]["group"] = group.strip()
+                if isinstance(import_user, str) and import_user.strip():
+                    result[key]["import_user"] = import_user.strip()
     return result
 
 
@@ -517,6 +542,24 @@ def build_dataset_name(rel_dir: str) -> str:
     return rel_dir.replace("/", " :: ")
 
 
+def state_scope_key(root_key: str, owner: str, group: str) -> str:
+    """Scope state by root, owner, and group so config changes do not collide."""
+
+    return f"{root_key}|owner={owner}|group={group}"
+
+
+def imported_file_key(root_key: str, owner: str, group: str, abs_path: str) -> str:
+    """Build the scoped imported-file state key for current ownership config."""
+
+    return f"{state_scope_key(root_key, owner, group)}:{abs_path}"
+
+
+def legacy_imported_file_key(root_key: str, abs_path: str) -> str:
+    """Build the pre-owner/group imported-file state key."""
+
+    return f"{root_key}:{abs_path}"
+
+
 def get_or_create_project(  # noqa: PLR0913
     owner: str,
     password: str,
@@ -526,9 +569,16 @@ def get_or_create_project(  # noqa: PLR0913
     source: str,
     project_state: dict[str, int],
 ) -> int:
-    if key in project_state:
-        print(f"[project] reuse Project:{project_state[key]} for {source}")
-        return project_state[key]
+    scoped_key = state_scope_key(key, owner, group)
+    legacy_project_id = project_state.pop(key, None)
+    if scoped_key in project_state:
+        print(f"[project] reuse Project:{project_state[scoped_key]} for {source}")
+        return project_state[scoped_key]
+    if legacy_project_id is not None:
+        print(
+            "[project] ignoring legacy unscoped Project:"
+            f"{legacy_project_id} for {source}; owner={owner} group={group}"
+        )
     print(f"[project] creating project for root source: {source}")
     name = shlex.quote(build_project_name(root_prefix, source))
     created = run_as_user_with_retry(
@@ -539,7 +589,7 @@ def get_or_create_project(  # noqa: PLR0913
             f"Failed to create project for {source}: {created.stderr.strip()}"
         )
     project_id = extract_object_id(created.stdout, "Project")
-    project_state[key] = project_id
+    project_state[scoped_key] = project_id
     return project_id
 
 
@@ -552,7 +602,8 @@ def get_or_create_dataset(  # noqa: PLR0913
     project_id: int,
     dataset_state: dict[str, int],
 ) -> tuple[int, bool]:
-    map_key = f"{root_key}|{rel_dir}"
+    map_key = f"{state_scope_key(root_key, owner, group)}|{rel_dir}"
+    dataset_state.pop(f"{root_key}|{rel_dir}", None)
     if map_key in dataset_state:
         print(f"[dataset] reuse Dataset:{dataset_state[map_key]} for {rel_dir}")
         return dataset_state[map_key], False
@@ -614,6 +665,7 @@ def delete_dataset(  # noqa: PLR0913
         group,
     )
     if result.returncode == 0:
+        dataset_state.pop(f"{state_scope_key(root_key, owner, group)}|{rel_dir}", None)
         dataset_state.pop(f"{root_key}|{rel_dir}", None)
 
 
@@ -706,7 +758,7 @@ def delete_missing_imports(  # noqa: PLR0913
     """Remove OMERO images whose source files disappeared from a scanned root."""
 
     deleted = 0
-    root_prefix = f"{root_key}:"
+    root_prefix = f"{state_scope_key(root_key, owner, shared_group)}:"
     stale_tracking_keys = sorted(
         key
         for key in imported
@@ -723,7 +775,11 @@ def delete_missing_imports(  # noqa: PLR0913
         abs_path = tracking_key.removeprefix(root_prefix)
         rel_path = rel_path_from_root(abs_path, container_root)
         rel_dir = dataset_key_for_rel_path(rel_path)
-        dataset_id = dataset_state.get(f"{root_key}|{rel_dir}")
+        dataset_id = dataset_state.get(
+            f"{state_scope_key(root_key, owner, shared_group)}|{rel_dir}"
+        )
+        if dataset_id is None:
+            dataset_id = dataset_state.get(f"{root_key}|{rel_dir}")
         if dataset_id is None:
             imported.remove(tracking_key)
             deleted += 1
@@ -782,7 +838,7 @@ def import_one_file(  # noqa: PLR0913
 ) -> tuple[bool, str, str]:
     """Import a file with retries and best-effort cleanup on failure."""
 
-    tracking_key = f"{root_key}:{abs_path}"
+    tracking_key = imported_file_key(root_key, owner, shared_group, abs_path)
     rel_path = rel_path_from_root(abs_path, container_root)
     rel_dir = dataset_key_for_rel_path(rel_path)
     dataset_id, dataset_created = get_or_create_dataset(
@@ -838,13 +894,14 @@ def import_to_dataset(  # noqa: PLR0913
     """Import one file when dataset is already known."""
 
     rel_path = rel_path_from_root(abs_path, container_root)
+    tracking_key = imported_file_key(root_key, owner, shared_group, abs_path)
     command = build_import_command(import_mode, dataset_id, abs_path)
     result: subprocess.CompletedProcess[str] | None = None
     for attempt in range(1, PER_FILE_RETRY_ATTEMPTS + 1):
         result = run_as_user_with_retry(owner, owner_password, command, shared_group)
         if result.returncode == 0:
             print(f"[import-done] [{root_key}] {rel_path} -> Dataset:{dataset_id}")
-            return True, f"{root_key}:{abs_path}", ""
+            return True, tracking_key, ""
         if not is_transient_import_error(result.stderr):
             break
         print(
@@ -853,7 +910,7 @@ def import_to_dataset(  # noqa: PLR0913
         )
         time.sleep(PER_FILE_RETRY_BACKOFF_SECONDS * attempt)
     assert result is not None
-    return False, f"{root_key}:{abs_path}", result.stderr.strip()
+    return False, tracking_key, result.stderr.strip()
 
 
 def summarize_import_error(error: str) -> str:
@@ -901,6 +958,7 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     import_progress_every_files: int,
     import_workers: int,
     delete_omero_missing_files: bool,
+    reimport_legacy_import_state: bool,
 ) -> tuple[int, dict[str, str], bool, dict[str, int]]:
     """Import files for a single root. Returns count, failures, hit_cap."""
 
@@ -975,12 +1033,27 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     "deleted_missing": deleted_missing_count,
                 },
             )
-        tracking_key = f"{root_key}:{abs_path}"
+        tracking_key = imported_file_key(root_key, owner, shared_group, abs_path)
+        legacy_tracking_key = legacy_imported_file_key(root_key, abs_path)
         if imported_count % 10 == 0:
             print(f"[import-candidate] {abs_path}")
         if tracking_key in imported:
             skipped_tracked_count += 1
             continue
+        if legacy_tracking_key in imported:
+            if reimport_legacy_import_state:
+                print(
+                    "[state-reimport] legacy import state exists; rechecking under "
+                    f"owner={owner} group={shared_group}: {abs_path}"
+                )
+            else:
+                print(
+                    "[state-migrate] legacy import state migrated without reimport "
+                    f"for owner={owner} group={shared_group}: {abs_path}"
+                )
+                imported.add(tracking_key)
+                skipped_tracked_count += 1
+                continue
         rel_path = rel_path_from_root(abs_path, container_root)
         rel_dir = dataset_key_for_rel_path(rel_path)
         dataset_id, _ = get_or_create_dataset(
@@ -1133,9 +1206,14 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     )
 
 
-def import_files() -> None:  # noqa: PLR0915
-    credentials, owner = load_user_credentials()
-    owner_password = credentials[owner]
+def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
+    credentials, fallback_owner = load_user_credentials()
+    default_import_user = load_default_import_user() or fallback_owner
+    if default_import_user not in credentials:
+        raise ImportConfigError(
+            f"Configured import_user is not present in users.yml: {default_import_user}"
+        )
+    reimport_legacy_import_state = load_reimport_legacy_import_state()
     (
         shared_group,
         root_prefix,
@@ -1176,8 +1254,15 @@ def import_files() -> None:  # noqa: PLR0915
             source = root_data["source"]
             container_root = root_data["container_root"]
             root_group = root_data.get("group", shared_group)
+            owner = root_data.get("import_user", default_import_user)
+            if owner not in credentials:
+                raise ImportConfigError(
+                    f"Configured root import_user is not present in users.yml: {owner}"
+                )
+            owner_password = credentials[owner]
             print(f"[root-begin] {root_key} source={source}")
             print(f"[root-begin] {root_key} container_root={container_root}")
+            print(f"[root-begin] {root_key} import_user={owner}")
             if root_group:
                 print(f"[root-begin] {root_key} group={root_group}")
             try:
@@ -1215,6 +1300,7 @@ def import_files() -> None:  # noqa: PLR0915
                 import_progress_every_files,
                 import_workers,
                 delete_omero_missing_files,
+                reimport_legacy_import_state,
             )
             imported_count += root_imported
             failures.update(root_failures)
