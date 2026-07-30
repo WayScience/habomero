@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -44,10 +45,20 @@ LIST_RETRY_BACKOFF_SECONDS = 3
 SCAN_PROGRESS_EVERY_PATHS = 100_000
 IMPORT_PROGRESS_EVERY_FILES = 50
 IMPORT_WORKERS = 1
+PROJECT_RECORD_COLUMN_COUNT = 4
 
 
 class ImportConfigError(ValueError):
     """Raised for invalid import configuration."""
+
+
+@dataclass(frozen=True)
+class ProjectRecord:
+    """Minimal OMERO Project placement details used for duplicate cleanup."""
+
+    project_id: int
+    group: str
+    owner: str
 
 
 def read_env_var(name: str) -> str:
@@ -106,6 +117,18 @@ def run_in_omero(command: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
+
+
+def run_as_root(command: str) -> subprocess.CompletedProcess[str]:
+    """Run an OMERO CLI command as root inside the server container."""
+
+    full = (
+        "set -euo pipefail; "
+        'export PATH="/opt/omero/server/venv3/bin:$PATH"; '
+        'omero -C -s localhost -p 4064 -u root -w "$ROOTPASS" -g system '
+        f"{command}"
+    )
+    return run_in_omero(full)
 
 
 def wait_for_server(max_attempts: int = 40, interval_seconds: int = 3) -> None:
@@ -298,6 +321,18 @@ def load_reimport_legacy_import_state() -> bool:
     payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
     value = payload.get("reimport_legacy_import_state")
     return value is True
+
+
+def load_cleanup_obsolete_duplicate_projects() -> bool:
+    """Load whether old same-named Project duplicates should be removed."""
+
+    if not SCAN_CONFIG_PATH.exists():
+        return True
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    value = payload.get("cleanup_obsolete_duplicate_projects")
+    if isinstance(value, bool):
+        return value
+    return True
 
 
 def is_db_healthy() -> bool:
@@ -536,6 +571,88 @@ def build_project_name(root_prefix: str, source_path: str) -> str:
     root_name = Path(source_path).name.strip()
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", root_name).strip("_")
     return f"{root_prefix} :: {safe or 'scan'}"
+
+
+def parse_project_records(output: str) -> list[ProjectRecord]:
+    """Parse OMERO CLI HQL table rows for Project placement records."""
+
+    records: list[ProjectRecord] = []
+    for line in output.splitlines():
+        if "|" not in line:
+            continue
+        cols = [col.strip() for col in line.split("|")]
+        if (
+            len(cols) < PROJECT_RECORD_COLUMN_COUNT
+            or not cols[0].isdigit()
+            or not cols[1].isdigit()
+        ):
+            continue
+        records.append(
+            ProjectRecord(
+                project_id=int(cols[1]),
+                group=cols[2],
+                owner=cols[3],
+            )
+        )
+    return records
+
+
+def list_projects_by_name(project_name: str) -> list[ProjectRecord]:
+    """List all OMERO Projects matching a generated scan-root Project name."""
+
+    query = (
+        "select p.id, details.group.name, details.owner.omeName "
+        f"from Project p where p.name = {hql_string(project_name)}"
+    )
+    result = run_as_root(f"hql {shlex.quote(query)}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(f"[duplicate-project-cleanup-warn] list failed: {detail}")
+        return []
+    return parse_project_records(result.stdout)
+
+
+def delete_project(project_id: int) -> bool:
+    """Delete an obsolete duplicate OMERO Project."""
+
+    result = run_as_root(f"delete Project:{project_id} -w --no-wait")
+    if result.returncode == 0:
+        return True
+    detail = result.stderr.strip() or result.stdout.strip()
+    print(f"[duplicate-project-cleanup-failed] Project:{project_id}: {detail}")
+    return False
+
+
+def cleanup_obsolete_duplicate_projects(
+    owner: str,
+    group: str,
+    root_prefix: str,
+    source: str,
+    keep_project_id: int,
+) -> int:
+    """Delete same-named scan-root Projects except the configured one."""
+
+    project_name = build_project_name(root_prefix, source)
+    records = list_projects_by_name(project_name)
+    duplicates = [record for record in records if record.project_id != keep_project_id]
+    if not duplicates:
+        return 0
+
+    deleted = 0
+    print(
+        "[duplicate-project-cleanup] "
+        f"name={project_name} keep=Project:{keep_project_id} "
+        f"configured_owner={owner} configured_group={group} "
+        f"duplicates={len(duplicates)}"
+    )
+    for record in duplicates:
+        print(
+            "[duplicate-project-cleanup-delete] "
+            f"Project:{record.project_id} owner={record.owner} group={record.group}"
+        )
+        if delete_project(record.project_id):
+            deleted += 1
+    return deleted
 
 
 def build_dataset_name(rel_dir: str) -> str:
@@ -1214,6 +1331,7 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
             f"Configured import_user is not present in users.yml: {default_import_user}"
         )
     reimport_legacy_import_state = load_reimport_legacy_import_state()
+    cleanup_duplicates = load_cleanup_obsolete_duplicate_projects()
     (
         shared_group,
         root_prefix,
@@ -1248,6 +1366,7 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
     total_skipped_tracked = 0
     total_skipped_existing = 0
     total_deleted_missing = 0
+    total_deleted_duplicate_projects = 0
     interrupted = False
     try:
         for root_key, root_data in sorted(roots.items()):
@@ -1318,6 +1437,20 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
                 f"skipped_existing={root_stats['skipped_existing']} "
                 f"deleted_missing={root_stats['deleted_missing']}"
             )
+            if cleanup_duplicates and not root_failures and not hit_cap:
+                total_deleted_duplicate_projects += cleanup_obsolete_duplicate_projects(
+                    owner,
+                    root_group,
+                    root_prefix,
+                    source,
+                    project_id,
+                )
+            elif cleanup_duplicates:
+                print(
+                    "[duplicate-project-cleanup-skip] "
+                    f"{root_key}: root did not finish cleanly "
+                    f"hit_cap={hit_cap} failures={len(root_failures)}"
+                )
             # Checkpoint state per root so restart can't replay completed root work.
             save_string_set(IMPORT_STATE_PATH, imported)
             save_int_map(DATASET_STATE_PATH, dataset_state)
@@ -1340,6 +1473,7 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
         f"imported_new={imported_count} skipped_tracked={total_skipped_tracked} "
         f"skipped_existing={total_skipped_existing} failures={len(failures)} "
         f"deleted_missing={total_deleted_missing} tracked_before={imported_before} "
+        f"deleted_duplicate_projects={total_deleted_duplicate_projects} "
         f"tracked_after={imported_after}"
     )
     if interrupted:

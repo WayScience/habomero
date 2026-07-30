@@ -400,6 +400,21 @@ def test_import_config_loads_legacy_reimport_flag(
     assert import_scan.load_reimport_legacy_import_state() is True
 
 
+def test_import_config_loads_duplicate_project_cleanup_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Obsolete duplicate Project cleanup is enabled by default and configurable."""
+
+    config_path = tmp_path / "scan_dirs.yml"
+    config_path.write_text(
+        "cleanup_obsolete_duplicate_projects: false\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(import_scan, "SCAN_CONFIG_PATH", config_path)
+
+    assert import_scan.load_cleanup_obsolete_duplicate_projects() is False
+
+
 def test_import_state_keys_include_owner_and_group() -> None:
     """Project/dataset state is scoped to avoid reusing old ownership."""
 
@@ -420,6 +435,57 @@ def test_import_state_keys_include_owner_and_group() -> None:
         import_scan.legacy_imported_file_key("root_a", "/scan/roots/root_a/image.tif")
         == "root_a:/scan/roots/root_a/image.tif"
     )
+
+
+def test_parse_project_records() -> None:
+    """Project placement rows are parsed from OMERO HQL table output."""
+
+    records = import_scan.parse_project_records(
+        " # | Col1 | Col2 | Col3\n"
+        "---+------+-------+------\n"
+        " 0 | 51   | way_mckinsey_cardiac_fibrosis | habomero\n"
+    )
+
+    assert records == [
+        import_scan.ProjectRecord(
+            project_id=51,
+            group="way_mckinsey_cardiac_fibrosis",
+            owner="habomero",
+        )
+    ]
+
+
+def test_cleanup_obsolete_duplicate_projects_keeps_current_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate cleanup removes same-named Projects except the configured one."""
+
+    deleted: list[int] = []
+
+    monkeypatch.setattr(
+        import_scan,
+        "list_projects_by_name",
+        lambda name: [
+            import_scan.ProjectRecord(10, "lab", "habomero"),
+            import_scan.ProjectRecord(51, "way_mckinsey_cardiac_fibrosis", "habomero"),
+        ],
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "delete_project",
+        lambda project_id: not deleted.append(project_id),
+    )
+
+    count = import_scan.cleanup_obsolete_duplicate_projects(
+        "habomero",
+        "way_mckinsey_cardiac_fibrosis",
+        "scan-root",
+        "/home/davebunten/mnt/Way_McKinsey_Cardiac_Fibrosis",
+        51,
+    )
+
+    assert count == 1
+    assert deleted == [10]
 
 
 def test_safe_restart_compose_args_include_scan_roots_when_present(

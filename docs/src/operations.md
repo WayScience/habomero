@@ -146,6 +146,9 @@ With `reimport_legacy_import_state: true`, files tracked by an older owner/group
 state format are rechecked and imported into the current configured owner/group.
 This repopulates the desired OMERO location after config changes; it does not
 delete old OMERO objects that were already imported elsewhere.
+With `cleanup_obsolete_duplicate_projects: true`, a root that finishes cleanly
+deletes same-named generated scan-root Projects from older owner/group
+placements while keeping the currently configured Project.
 
 ## Backup
 

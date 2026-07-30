@@ -37,6 +37,10 @@ delete_omero_missing_files: true
 # rechecked/reimported under the current owner/group config so placement config
 # changes can repopulate the configured OMERO location.
 reimport_legacy_import_state: true
+# When true, after a root imports cleanly, same-named scan-root Projects from
+# older owner/group placements are deleted while the currently configured
+# Project is kept.
+cleanup_obsolete_duplicate_projects: true
 
 # Safety controls for high-latency/remote sources:
 # Maximum number of files to attempt in a single import-scan run.
