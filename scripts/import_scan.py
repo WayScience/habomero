@@ -601,7 +601,7 @@ def list_projects_by_name(project_name: str) -> list[ProjectRecord]:
     """List all OMERO Projects matching a generated scan-root Project name."""
 
     query = (
-        "select p.id, details.group.name, details.owner.omeName "
+        "select p.id, details.group.id, details.owner.omeName "
         f"from Project p where p.name = {hql_string(project_name)}"
     )
     result = run_as_root(f"hql {shlex.quote(query)}")

@@ -455,6 +455,35 @@ def test_parse_project_records() -> None:
     ]
 
 
+def test_list_projects_by_name_uses_group_id_hql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Duplicate cleanup queries group id to avoid OMERO group-name HQL errors."""
+
+    commands: list[str] = []
+
+    def fake_run_as_root(command: str) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=(
+                " # | Col1 | Col2 | Col3\n"
+                "---+------+-------+------\n"
+                " 0 | 51   | 53 | habomero\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(import_scan, "run_as_root", fake_run_as_root)
+
+    records = import_scan.list_projects_by_name("scan-root :: test")
+
+    assert records == [import_scan.ProjectRecord(51, "53", "habomero")]
+    assert "details.group.id" in commands[0]
+    assert "details.group.name" not in commands[0]
+
+
 def test_cleanup_obsolete_duplicate_projects_keeps_current_project(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
