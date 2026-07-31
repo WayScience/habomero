@@ -232,6 +232,29 @@ def ensure_user_group_membership(root_password: str, username: str, group: str) 
     raise RuntimeError(f"Failed to set group membership for '{username}': {stderr}")
 
 
+def ensure_user_group_absence(root_password: str, username: str, group: str) -> None:
+    """Best-effort remove a user from a non-primary shared group."""
+
+    commands = [
+        f"omero user leavegroup {group} --name={username}",
+        f"omero user leavegroup --name={username} {group}",
+        f"omero user leavegroup --user-name {username} {group}",
+    ]
+    last_error = ""
+    for cmd in commands:
+        result = run_in_omero_with_retry(root_password, cmd)
+        if result.returncode == 0:
+            print(f"group-removed: {username} -> {group}")
+            return
+        last_error = result.stderr.strip() or result.stdout.strip()
+        lowered = last_error.lower()
+        if "not a member" in lowered or "not in group" in lowered:
+            print(f"group-absent: {username} -> {group}")
+            return
+
+    print(f"group-remove-warn: could not remove {username} from {group}: {last_error}")
+
+
 def ensure_default_group(
     root_password: str,
     username: str,
@@ -415,7 +438,7 @@ def load_users() -> list[dict[str, object]]:  # noqa: C901, PLR0912, PLR0915
             normalized_extra_groups.append(normalized_group)
         row["extra_groups"] = normalized_extra_groups
 
-        join_shared_group = item.get("join_shared_group", True)
+        join_shared_group = item.get("join_shared_group", False)
         if not isinstance(join_shared_group, bool):
             raise UserConfigError("User field 'join_shared_group' must be a boolean")
         row["join_shared_group"] = join_shared_group
@@ -461,6 +484,54 @@ def load_shared_group_permissions() -> str:
     return raw.strip()
 
 
+def load_scan_group_permissions() -> str:
+    """Load optional per-scan-root group permissions."""
+
+    default = "read-annotate"
+    if not SCAN_CONFIG_PATH.exists():
+        return default
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    raw = payload.get("scan_group_permissions")
+    if raw is None:
+        return default
+    if not isinstance(raw, str) or not raw.strip():
+        raise UserConfigError(
+            "scan_group_permissions must be a non-empty string when provided"
+        )
+    return raw.strip()
+
+
+def load_scan_groups() -> set[str]:
+    """Load explicitly configured per-root scan groups."""
+
+    if not SCAN_CONFIG_PATH.exists():
+        return set()
+    payload = yaml.safe_load(SCAN_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    raw_dirs = payload.get("scan_directories", [])
+    if not isinstance(raw_dirs, list):
+        raise UserConfigError("scan_directories must be a YAML list")
+
+    groups: set[str] = set()
+    for item in raw_dirs:
+        if not isinstance(item, dict):
+            continue
+        group = item.get("group")
+        if group is None:
+            continue
+        if not isinstance(group, str) or not group.strip():
+            raise UserConfigError(
+                "scan_directories group entries must be non-empty strings"
+            )
+        normalized = group.strip()
+        if normalized in RESERVED_GROUPS:
+            raise UserConfigError(
+                "scan_directories group entries must be non-reserved data groups "
+                "(not one of: user, guest, system)"
+            )
+        groups.add(normalized)
+    return groups
+
+
 def main() -> None:
     """Load user config and sync each entry into OMERO."""
 
@@ -469,9 +540,13 @@ def main() -> None:
     users = load_users()
     shared_group = load_shared_group()
     shared_group_permissions = load_shared_group_permissions()
+    scan_group_permissions = load_scan_group_permissions()
     if shared_group:
         ensure_group(root_password, shared_group)
         ensure_group_permissions(root_password, shared_group, shared_group_permissions)
+    for group in sorted(load_scan_groups()):
+        ensure_group(root_password, group)
+        ensure_group_permissions(root_password, group, scan_group_permissions)
     for user in users:
         ensure_user(root_password, user)
         username = str(user["username"])
@@ -480,10 +555,12 @@ def main() -> None:
         if (
             shared_group
             and primary_group != shared_group
-            and user.get("join_shared_group", True)
+            and user.get("join_shared_group", False)
         ):
             ensure_user_group_membership(root_password, username, shared_group)
             ensure_default_group(root_password, username, shared_group)
+        elif shared_group and primary_group != shared_group:
+            ensure_user_group_absence(root_password, username, shared_group)
 
 
 if __name__ == "__main__":
