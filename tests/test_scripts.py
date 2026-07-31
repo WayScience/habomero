@@ -608,6 +608,7 @@ def test_reconcile_project_id_prefers_configured_owner_group(
         ],
     )
     monkeypatch.setattr(import_scan, "group_ids_by_name", lambda group: {"53"})
+    monkeypatch.setattr(import_scan, "project_dataset_count", lambda project_id: 0)
 
     project_id = import_scan.reconcile_project_id(
         "habomero",
