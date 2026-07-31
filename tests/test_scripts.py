@@ -527,6 +527,66 @@ def test_cleanup_obsolete_duplicate_projects_keeps_current_project(
     assert deleted == [10]
 
 
+def test_parse_dataset_records() -> None:
+    """Dataset rows are parsed from OMERO HQL table output."""
+
+    records = import_scan.parse_dataset_records(
+        " # | Col1 | Col2\n---+------+------\n 0 | 101  | SPLAT_data :: pilot_images\n"
+    )
+
+    assert records == [
+        import_scan.DatasetRecord(
+            dataset_id=101,
+            name="SPLAT_data :: pilot_images",
+        )
+    ]
+
+
+def test_cleanup_obsolete_duplicate_datasets_keeps_current_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dataset cleanup removes duplicate folder names under the kept Project."""
+
+    deleted: list[int] = []
+
+    monkeypatch.setattr(
+        import_scan,
+        "list_project_datasets",
+        lambda project_id: [
+            import_scan.DatasetRecord(100, "SPLAT_data :: pilot_images"),
+            import_scan.DatasetRecord(101, "SPLAT_data :: pilot_images"),
+            import_scan.DatasetRecord(200, "other"),
+        ],
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "delete_dataset_as_root",
+        lambda dataset_id: not deleted.append(dataset_id),
+    )
+
+    count = import_scan.cleanup_obsolete_duplicate_datasets(51, {101})
+
+    assert count == 1
+    assert deleted == [100]
+
+
+def test_current_dataset_ids_for_root_only_current_scope() -> None:
+    """Current Dataset IDs come only from the configured root owner/group scope."""
+
+    dataset_state = {
+        "root_a|owner=habomero|group=way|path/a": 101,
+        "root_a|owner=legacy|group=lab|path/a": 100,
+        "root_b|owner=habomero|group=way|path/a": 200,
+    }
+
+    assert import_scan.current_dataset_ids_for_root(
+        dataset_state,
+        "root_a",
+        "habomero",
+        "way",
+    ) == {101}
+
+
 def test_safe_restart_compose_args_include_scan_roots_when_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -46,6 +46,8 @@ SCAN_PROGRESS_EVERY_PATHS = 100_000
 IMPORT_PROGRESS_EVERY_FILES = 50
 IMPORT_WORKERS = 1
 PROJECT_RECORD_COLUMN_COUNT = 5
+DATASET_RECORD_COLUMN_COUNT = 3
+DUPLICATE_RECORD_MIN_COUNT = 2
 
 
 class ImportConfigError(ValueError):
@@ -60,6 +62,14 @@ class ProjectRecord:
     name: str
     group: str
     owner: str
+
+
+@dataclass(frozen=True)
+class DatasetRecord:
+    """Minimal OMERO Dataset details used for duplicate cleanup."""
+
+    dataset_id: int
+    name: str
 
 
 def read_env_var(name: str) -> str:
@@ -624,6 +634,84 @@ def delete_project(project_id: int) -> bool:
     return False
 
 
+def parse_dataset_records(output: str) -> list[DatasetRecord]:
+    """Parse OMERO CLI HQL table rows for Dataset records."""
+
+    records: list[DatasetRecord] = []
+    for line in output.splitlines():
+        if "|" not in line:
+            continue
+        cols = [col.strip() for col in line.split("|")]
+        if len(cols) < DATASET_RECORD_COLUMN_COUNT or not cols[0].isdigit():
+            continue
+        records.append(DatasetRecord(dataset_id=int(cols[1]), name=cols[2]))
+    return records
+
+
+def list_project_datasets(project_id: int) -> list[DatasetRecord]:
+    """List all Datasets linked under a Project."""
+
+    query = (
+        "select d.id, d.name from Dataset d "
+        f"join d.projectLinks l where l.parent.id = {project_id}"
+    )
+    result = run_as_root(f"hql {shlex.quote(query)}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(f"[duplicate-dataset-cleanup-warn] list failed: {detail}")
+        return []
+    return parse_dataset_records(result.stdout)
+
+
+def delete_dataset_as_root(dataset_id: int) -> bool:
+    """Delete an obsolete duplicate OMERO Dataset."""
+
+    result = run_as_root(f"delete Dataset:{dataset_id} -w --no-wait")
+    if result.returncode == 0:
+        return True
+    detail = result.stderr.strip() or result.stdout.strip()
+    print(f"[duplicate-dataset-cleanup-failed] Dataset:{dataset_id}: {detail}")
+    return False
+
+
+def cleanup_obsolete_duplicate_datasets(
+    project_id: int,
+    keep_dataset_ids: set[int],
+) -> int:
+    """Delete duplicate Dataset names under one Project."""
+
+    datasets_by_name: dict[str, list[DatasetRecord]] = {}
+    for record in list_project_datasets(project_id):
+        datasets_by_name.setdefault(record.name, []).append(record)
+
+    deleted = 0
+    for dataset_name, records in sorted(datasets_by_name.items()):
+        if len(records) < DUPLICATE_RECORD_MIN_COUNT:
+            continue
+        current_records = [
+            record for record in records if record.dataset_id in keep_dataset_ids
+        ]
+        keep_id = (
+            current_records[0].dataset_id
+            if current_records
+            else max(record.dataset_id for record in records)
+        )
+        duplicates = [record for record in records if record.dataset_id != keep_id]
+        print(
+            "[duplicate-dataset-cleanup] "
+            f"project=Project:{project_id} name={dataset_name} "
+            f"keep=Dataset:{keep_id} duplicates={len(duplicates)}"
+        )
+        for record in duplicates:
+            print(
+                "[duplicate-dataset-cleanup-delete] "
+                f"Dataset:{record.dataset_id} name={record.name}"
+            )
+            if delete_dataset_as_root(record.dataset_id):
+                deleted += 1
+    return deleted
+
+
 def cleanup_obsolete_duplicate_projects(
     owner: str,
     group: str,
@@ -664,6 +752,22 @@ def state_scope_key(root_key: str, owner: str, group: str) -> str:
     """Scope state by root, owner, and group so config changes do not collide."""
 
     return f"{root_key}|owner={owner}|group={group}"
+
+
+def current_dataset_ids_for_root(
+    dataset_state: dict[str, int],
+    root_key: str,
+    owner: str,
+    group: str,
+) -> set[int]:
+    """Return Dataset IDs tracked for the current root owner/group placement."""
+
+    prefix = f"{state_scope_key(root_key, owner, group)}|"
+    return {
+        dataset_id
+        for key, dataset_id in dataset_state.items()
+        if key.startswith(prefix)
+    }
 
 
 def imported_file_key(root_key: str, owner: str, group: str, abs_path: str) -> str:
@@ -1368,6 +1472,7 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
     total_skipped_existing = 0
     total_deleted_missing = 0
     total_deleted_duplicate_projects = 0
+    total_deleted_duplicate_datasets = 0
     interrupted = False
     try:
         for root_key, root_data in sorted(roots.items()):
@@ -1446,6 +1551,15 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
                     source,
                     project_id,
                 )
+                total_deleted_duplicate_datasets += cleanup_obsolete_duplicate_datasets(
+                    project_id,
+                    current_dataset_ids_for_root(
+                        dataset_state,
+                        root_key,
+                        owner,
+                        root_group,
+                    ),
+                )
             elif cleanup_duplicates:
                 print(
                     "[duplicate-project-cleanup-skip] "
@@ -1475,6 +1589,7 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
         f"skipped_existing={total_skipped_existing} failures={len(failures)} "
         f"deleted_missing={total_deleted_missing} tracked_before={imported_before} "
         f"deleted_duplicate_projects={total_deleted_duplicate_projects} "
+        f"deleted_duplicate_datasets={total_deleted_duplicate_datasets} "
         f"tracked_after={imported_after}"
     )
     if interrupted:
