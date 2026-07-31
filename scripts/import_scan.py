@@ -45,7 +45,7 @@ LIST_RETRY_BACKOFF_SECONDS = 3
 SCAN_PROGRESS_EVERY_PATHS = 100_000
 IMPORT_PROGRESS_EVERY_FILES = 50
 IMPORT_WORKERS = 1
-PROJECT_RECORD_COLUMN_COUNT = 4
+PROJECT_RECORD_COLUMN_COUNT = 5
 
 
 class ImportConfigError(ValueError):
@@ -57,6 +57,7 @@ class ProjectRecord:
     """Minimal OMERO Project placement details used for duplicate cleanup."""
 
     project_id: int
+    name: str
     group: str
     owner: str
 
@@ -581,17 +582,14 @@ def parse_project_records(output: str) -> list[ProjectRecord]:
         if "|" not in line:
             continue
         cols = [col.strip() for col in line.split("|")]
-        if (
-            len(cols) < PROJECT_RECORD_COLUMN_COUNT
-            or not cols[0].isdigit()
-            or not cols[1].isdigit()
-        ):
+        if len(cols) < PROJECT_RECORD_COLUMN_COUNT or not cols[0].isdigit():
             continue
         records.append(
             ProjectRecord(
                 project_id=int(cols[1]),
-                group=cols[2],
-                owner=cols[3],
+                name=cols[2],
+                group=cols[3],
+                owner=cols[4],
             )
         )
     return records
@@ -601,15 +599,18 @@ def list_projects_by_name(project_name: str) -> list[ProjectRecord]:
     """List all OMERO Projects matching a generated scan-root Project name."""
 
     query = (
-        "select p.id, details.group.id, details.owner.omeName "
-        f"from Project p where p.name = {hql_string(project_name)}"
+        "select p.id, p.name, details.group.id, details.owner.omeName from Project p"
     )
     result = run_as_root(f"hql {shlex.quote(query)}")
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         print(f"[duplicate-project-cleanup-warn] list failed: {detail}")
         return []
-    return parse_project_records(result.stdout)
+    return [
+        record
+        for record in parse_project_records(result.stdout)
+        if record.name == project_name
+    ]
 
 
 def delete_project(project_id: int) -> bool:

@@ -441,24 +441,25 @@ def test_parse_project_records() -> None:
     """Project placement rows are parsed from OMERO HQL table output."""
 
     records = import_scan.parse_project_records(
-        " # | Col1 | Col2 | Col3\n"
-        "---+------+-------+------\n"
-        " 0 | 51   | way_mckinsey_cardiac_fibrosis | habomero\n"
+        " # | Col1 | Col2 | Col3 | Col4\n"
+        "---+------+-------+------+------\n"
+        " 0 | 51   | scan-root :: test | 53 | habomero\n"
     )
 
     assert records == [
         import_scan.ProjectRecord(
             project_id=51,
-            group="way_mckinsey_cardiac_fibrosis",
+            name="scan-root :: test",
+            group="53",
             owner="habomero",
         )
     ]
 
 
-def test_list_projects_by_name_uses_group_id_hql(
+def test_list_projects_by_name_filters_in_python(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Duplicate cleanup queries group id to avoid OMERO group-name HQL errors."""
+    """Duplicate cleanup avoids HQL literals for names containing colons."""
 
     commands: list[str] = []
 
@@ -468,9 +469,10 @@ def test_list_projects_by_name_uses_group_id_hql(
             args=command,
             returncode=0,
             stdout=(
-                " # | Col1 | Col2 | Col3\n"
-                "---+------+-------+------\n"
-                " 0 | 51   | 53 | habomero\n"
+                " # | Col1 | Col2 | Col3 | Col4\n"
+                "---+------+-------+------+------\n"
+                " 0 | 10   | scan-root :: other | 1 | habomero\n"
+                " 1 | 51   | scan-root :: test | 53 | habomero\n"
             ),
             stderr="",
         )
@@ -479,7 +481,11 @@ def test_list_projects_by_name_uses_group_id_hql(
 
     records = import_scan.list_projects_by_name("scan-root :: test")
 
-    assert records == [import_scan.ProjectRecord(51, "53", "habomero")]
+    assert records == [
+        import_scan.ProjectRecord(51, "scan-root :: test", "53", "habomero")
+    ]
+    assert "p.name =" not in commands[0]
+    assert "scan-root :: test" not in commands[0]
     assert "details.group.id" in commands[0]
     assert "details.group.name" not in commands[0]
 
@@ -495,8 +501,12 @@ def test_cleanup_obsolete_duplicate_projects_keeps_current_project(
         import_scan,
         "list_projects_by_name",
         lambda name: [
-            import_scan.ProjectRecord(10, "lab", "habomero"),
-            import_scan.ProjectRecord(51, "way_mckinsey_cardiac_fibrosis", "habomero"),
+            import_scan.ProjectRecord(
+                10, "scan-root :: Way_McKinsey_Cardiac_Fibrosis", "1", "habomero"
+            ),
+            import_scan.ProjectRecord(
+                51, "scan-root :: Way_McKinsey_Cardiac_Fibrosis", "53", "habomero"
+            ),
         ],
     )
     monkeypatch.setattr(
