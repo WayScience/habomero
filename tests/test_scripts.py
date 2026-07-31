@@ -626,6 +626,51 @@ def test_reconcile_project_id_prefers_configured_owner_group(
     )
 
 
+def test_reconcile_project_id_prefers_project_with_more_datasets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When placement matches, the Project with more child Datasets is kept."""
+
+    richer_project_id = 51
+    project_state = {"root_a|owner=habomero|group=way_mckinsey": 10}
+
+    monkeypatch.setattr(
+        import_scan,
+        "list_projects_by_name",
+        lambda name: [
+            import_scan.ProjectRecord(10, name, "53", "habomero"),
+            import_scan.ProjectRecord(richer_project_id, name, "53", "habomero"),
+        ],
+    )
+    monkeypatch.setattr(import_scan, "group_ids_by_name", lambda group: {"53"})
+    monkeypatch.setattr(
+        import_scan,
+        "list_project_datasets",
+        lambda project_id: [
+            import_scan.DatasetRecord(100, "one"),
+            import_scan.DatasetRecord(101, "two"),
+            import_scan.DatasetRecord(102, "three"),
+        ]
+        if project_id == richer_project_id
+        else [import_scan.DatasetRecord(99, "one")],
+    )
+
+    project_id = import_scan.reconcile_project_id(
+        "habomero",
+        "way_mckinsey",
+        "root_a",
+        "scan-root",
+        "/mnt/Way_McKinsey_Cardiac_Fibrosis",
+        10,
+        project_state,
+    )
+
+    assert project_id == richer_project_id
+    assert (
+        project_state["root_a|owner=habomero|group=way_mckinsey"] == richer_project_id
+    )
+
+
 def test_cleanup_obsolete_duplicate_datasets_keeps_current_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

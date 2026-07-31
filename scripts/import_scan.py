@@ -737,6 +737,12 @@ def group_ids_by_name(group_name: str) -> set[str]:
     }
 
 
+def project_dataset_count(project_id: int) -> int:
+    """Count Datasets linked under a Project."""
+
+    return len(list_project_datasets(project_id))
+
+
 def choose_configured_project_record(
     records: list[ProjectRecord],
     owner: str,
@@ -751,7 +757,13 @@ def choose_configured_project_record(
         if record.owner == owner and (not group_ids or record.group in group_ids)
     ]
     if configured_records:
-        return max(configured_records, key=lambda record: record.project_id)
+        return max(
+            configured_records,
+            key=lambda record: (
+                project_dataset_count(record.project_id),
+                record.project_id,
+            ),
+        )
     for record in records:
         if record.project_id == fallback_project_id:
             return record
