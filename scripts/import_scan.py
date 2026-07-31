@@ -47,6 +47,7 @@ IMPORT_PROGRESS_EVERY_FILES = 50
 IMPORT_WORKERS = 1
 PROJECT_RECORD_COLUMN_COUNT = 5
 DATASET_RECORD_COLUMN_COUNT = 3
+GROUP_RECORD_COLUMN_COUNT = 3
 DUPLICATE_RECORD_MIN_COUNT = 2
 
 
@@ -69,6 +70,14 @@ class DatasetRecord:
     """Minimal OMERO Dataset details used for duplicate cleanup."""
 
     dataset_id: int
+    name: str
+
+
+@dataclass(frozen=True)
+class GroupRecord:
+    """Minimal OMERO group details used for placement reconciliation."""
+
+    group_id: int
     name: str
 
 
@@ -140,6 +149,23 @@ def run_as_root(command: str) -> subprocess.CompletedProcess[str]:
         f"{command}"
     )
     return run_in_omero(full)
+
+
+def run_as_root_with_retry(command: str) -> subprocess.CompletedProcess[str]:
+    """Retry transient OMERO root-session failures during cleanup."""
+
+    last: subprocess.CompletedProcess[str] | None = None
+    for _ in range(RETRY_ATTEMPTS):
+        result = run_as_root(command)
+        last = result
+        if result.returncode == 0:
+            return result
+        combined_output = f"{result.stderr}\n{result.stdout}"
+        if not is_transient_import_error(combined_output):
+            return result
+        time.sleep(RETRY_INTERVAL_SECONDS)
+    assert last is not None
+    return last
 
 
 def wait_for_server(max_attempts: int = 40, interval_seconds: int = 3) -> None:
@@ -500,6 +526,9 @@ def is_transient_import_error(stderr: str) -> bool:
         "timed out",
         "connectionrefused",
         "isn't running",
+        "connecttimeoutexception",
+        "server not fully initialized",
+        "obtained null object prox",
     )
     lowered = stderr.lower()
     return any(marker in lowered for marker in transient_markers)
@@ -611,7 +640,7 @@ def list_projects_by_name(project_name: str) -> list[ProjectRecord]:
     query = (
         "select p.id, p.name, details.group.id, details.owner.omeName from Project p"
     )
-    result = run_as_root(f"hql {shlex.quote(query)}")
+    result = run_as_root_with_retry(f"hql {shlex.quote(query)}")
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         print(f"[duplicate-project-cleanup-warn] list failed: {detail}")
@@ -626,7 +655,7 @@ def list_projects_by_name(project_name: str) -> list[ProjectRecord]:
 def delete_project(project_id: int) -> bool:
     """Delete an obsolete duplicate OMERO Project."""
 
-    result = run_as_root(f"delete Project:{project_id} -w --no-wait")
+    result = run_as_root_with_retry(f"delete Project:{project_id} -w --no-wait")
     if result.returncode == 0:
         return True
     detail = result.stderr.strip() or result.stdout.strip()
@@ -655,7 +684,7 @@ def list_project_datasets(project_id: int) -> list[DatasetRecord]:
         "select d.id, d.name from Dataset d "
         f"join d.projectLinks l where l.parent.id = {project_id}"
     )
-    result = run_as_root(f"hql {shlex.quote(query)}")
+    result = run_as_root_with_retry(f"hql {shlex.quote(query)}")
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         print(f"[duplicate-dataset-cleanup-warn] list failed: {detail}")
@@ -666,12 +695,103 @@ def list_project_datasets(project_id: int) -> list[DatasetRecord]:
 def delete_dataset_as_root(dataset_id: int) -> bool:
     """Delete an obsolete duplicate OMERO Dataset."""
 
-    result = run_as_root(f"delete Dataset:{dataset_id} -w --no-wait")
+    result = run_as_root_with_retry(f"delete Dataset:{dataset_id} -w --no-wait")
     if result.returncode == 0:
         return True
     detail = result.stderr.strip() or result.stdout.strip()
     print(f"[duplicate-dataset-cleanup-failed] Dataset:{dataset_id}: {detail}")
     return False
+
+
+def parse_group_records(output: str) -> list[GroupRecord]:
+    """Parse OMERO CLI HQL table rows for group records."""
+
+    records: list[GroupRecord] = []
+    for line in output.splitlines():
+        if "|" not in line:
+            continue
+        cols = [col.strip() for col in line.split("|")]
+        if len(cols) < GROUP_RECORD_COLUMN_COUNT or not cols[0].isdigit():
+            continue
+        records.append(GroupRecord(group_id=int(cols[1]), name=cols[2]))
+    return records
+
+
+def list_groups() -> list[GroupRecord]:
+    """List OMERO groups."""
+
+    query = "select g.id, g.name from ExperimenterGroup g"
+    result = run_as_root_with_retry(f"hql {shlex.quote(query)}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        print(f"[project-reconcile-warn] group list failed: {detail}")
+        return []
+    return parse_group_records(result.stdout)
+
+
+def group_ids_by_name(group_name: str) -> set[str]:
+    """Return OMERO group IDs matching a configured group name."""
+
+    return {
+        str(record.group_id) for record in list_groups() if record.name == group_name
+    }
+
+
+def choose_configured_project_record(
+    records: list[ProjectRecord],
+    owner: str,
+    group_ids: set[str],
+    fallback_project_id: int,
+) -> ProjectRecord | None:
+    """Choose the Project matching configured owner/group, or a fallback ID."""
+
+    configured_records = [
+        record
+        for record in records
+        if record.owner == owner and (not group_ids or record.group in group_ids)
+    ]
+    if configured_records:
+        return max(configured_records, key=lambda record: record.project_id)
+    for record in records:
+        if record.project_id == fallback_project_id:
+            return record
+    return None
+
+
+def reconcile_project_id(  # noqa: PLR0913
+    owner: str,
+    group: str,
+    root_key: str,
+    root_prefix: str,
+    source: str,
+    project_id: int,
+    project_state: dict[str, int],
+) -> int:
+    """Prefer the configured owner/group Project over stale local state."""
+
+    project_name = build_project_name(root_prefix, source)
+    records = list_projects_by_name(project_name)
+    if not records:
+        return project_id
+    group_ids = group_ids_by_name(group) if group else set()
+    configured_record = choose_configured_project_record(
+        records,
+        owner,
+        group_ids,
+        project_id,
+    )
+    if configured_record is None or configured_record.project_id == project_id:
+        return project_id
+    print(
+        "[project-reconcile] "
+        f"{root_key}: state Project:{project_id} -> "
+        f"configured Project:{configured_record.project_id} "
+        f"owner={configured_record.owner} group={configured_record.group}"
+    )
+    project_state[state_scope_key(root_key, owner, group)] = (
+        configured_record.project_id
+    )
+    return configured_record.project_id
 
 
 def cleanup_obsolete_duplicate_datasets(
@@ -1503,6 +1623,15 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
             except RuntimeError as exc:
                 print(f"[root-failed] {source}: {exc}")
                 continue
+            project_id = reconcile_project_id(
+                owner,
+                root_group,
+                root_key,
+                root_prefix,
+                source,
+                project_id,
+                project_state,
+            )
 
             budget_remaining = (
                 max_files_per_run - imported_count if max_files_per_run > 0 else 0

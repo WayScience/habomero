@@ -490,6 +490,38 @@ def test_list_projects_by_name_filters_in_python(
     assert "details.group.name" not in commands[0]
 
 
+def test_root_cleanup_commands_retry_transient_session_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Root cleanup commands retry when OMERO is temporarily not initialized."""
+
+    attempts: list[str] = []
+
+    def fake_run_as_root(command: str) -> subprocess.CompletedProcess[str]:
+        attempts.append(command)
+        if len(attempts) == 1:
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout="",
+                stderr="ApiUsageException:Server not fully initialized",
+            )
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="ok",
+            stderr="",
+        )
+
+    monkeypatch.setattr(import_scan, "run_as_root", fake_run_as_root)
+    monkeypatch.setattr(import_scan.time, "sleep", lambda seconds: None)
+
+    result = import_scan.run_as_root_with_retry("hql test")
+
+    assert result.returncode == 0
+    assert attempts == ["hql test", "hql test"]
+
+
 def test_cleanup_obsolete_duplicate_projects_keeps_current_project(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -540,6 +572,58 @@ def test_parse_dataset_records() -> None:
             name="SPLAT_data :: pilot_images",
         )
     ]
+
+
+def test_parse_group_records() -> None:
+    """Group rows are parsed from OMERO HQL table output."""
+
+    records = import_scan.parse_group_records(
+        " # | Col1 | Col2\n"
+        "---+------+------\n"
+        " 0 | 53   | way_mckinsey_cardiac_fibrosis\n"
+    )
+
+    assert records == [
+        import_scan.GroupRecord(
+            group_id=53,
+            name="way_mckinsey_cardiac_fibrosis",
+        )
+    ]
+
+
+def test_reconcile_project_id_prefers_configured_owner_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale local Project state is updated to configured OMERO placement."""
+
+    configured_project_id = 51
+    project_state = {"root_a|owner=habomero|group=way_mckinsey": 10}
+
+    monkeypatch.setattr(
+        import_scan,
+        "list_projects_by_name",
+        lambda name: [
+            import_scan.ProjectRecord(10, name, "1", "habomero"),
+            import_scan.ProjectRecord(configured_project_id, name, "53", "habomero"),
+        ],
+    )
+    monkeypatch.setattr(import_scan, "group_ids_by_name", lambda group: {"53"})
+
+    project_id = import_scan.reconcile_project_id(
+        "habomero",
+        "way_mckinsey",
+        "root_a",
+        "scan-root",
+        "/mnt/Way_McKinsey_Cardiac_Fibrosis",
+        10,
+        project_state,
+    )
+
+    assert project_id == configured_project_id
+    assert (
+        project_state["root_a|owner=habomero|group=way_mckinsey"]
+        == configured_project_id
+    )
 
 
 def test_cleanup_obsolete_duplicate_datasets_keeps_current_state(
