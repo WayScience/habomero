@@ -655,7 +655,7 @@ def list_projects_by_name(project_name: str) -> list[ProjectRecord]:
 def delete_project(project_id: int) -> bool:
     """Delete an obsolete duplicate OMERO Project."""
 
-    result = run_as_root_with_retry(f"delete Project:{project_id} -w --no-wait")
+    result = run_as_root_with_retry(f"delete Project:{project_id} --wait -1")
     if result.returncode == 0:
         return True
     detail = result.stderr.strip() or result.stdout.strip()
@@ -695,7 +695,7 @@ def list_project_datasets(project_id: int) -> list[DatasetRecord]:
 def delete_dataset_as_root(dataset_id: int) -> bool:
     """Delete an obsolete duplicate OMERO Dataset."""
 
-    result = run_as_root_with_retry(f"delete Dataset:{dataset_id} -w --no-wait")
+    result = run_as_root_with_retry(f"delete Dataset:{dataset_id} --wait -1")
     if result.returncode == 0:
         return True
     detail = result.stderr.strip() or result.stdout.strip()
@@ -1015,7 +1015,7 @@ def delete_dataset(  # noqa: PLR0913
     result = run_as_user_with_retry(
         owner,
         password,
-        f"omero delete Dataset:{dataset_id} -w --no-wait",
+        f"omero delete Dataset:{dataset_id} --wait -1",
         group,
     )
     if result.returncode == 0:
@@ -1093,7 +1093,7 @@ def delete_image(
     result = run_as_user_with_retry(
         owner,
         owner_password,
-        f"omero delete Image:{image_id} -w --no-wait",
+        f"omero delete Image:{image_id} --wait -1",
         shared_group,
     )
     return result.returncode == 0
