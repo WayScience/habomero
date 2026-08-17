@@ -1,7 +1,5 @@
 allow_external_paths: true
 scan_directories:
-  - path: ~/mnt/bandicoot/RxRx19a
-    group: rxrx19a
   - path: ~/mnt/bandicoot/CFReT_subtyping_data
     group: cfret_subtyping_data
   - path: ~/mnt/Way_McKinsey_Cardiac_Fibrosis
@@ -52,12 +50,12 @@ db_stable_check_interval_seconds: 1
 # Stop a run after this many per-file failures.
 max_failures_per_run: 25
 # Pause between individual file imports inside a run.
-sleep_between_imports_seconds: 2
+sleep_between_imports_seconds: 0
 
 # Remote-safe round runner (`uv run poe import-remote-safe`)
 safe_import_rounds: 30
 # Keep rounds responsive during active ingest while avoiding busy-loop churn.
-safe_import_pause_seconds: 5
+safe_import_pause_seconds: 2
 safe_import_stagnant_rounds: 3
 
 # Optional continuous periodic rescans (safe-import loop)
@@ -65,4 +63,4 @@ safe_import_stagnant_rounds: 3
 safe_import_continuous: false
 # Pause between completed safe-import cycles in continuous mode.
 # Lower than 300s to catch new files sooner without thrashing.
-safe_import_cycle_pause_seconds: 60
+safe_import_cycle_pause_seconds: 10

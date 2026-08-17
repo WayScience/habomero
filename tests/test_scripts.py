@@ -359,6 +359,54 @@ def test_delete_missing_imports_removes_deleted_image_tracking(
     assert state_path.read_text(encoding="utf-8").splitlines() == sorted(imported)
 
 
+def test_delete_calls_use_wait_flag_not_broken_password_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delete helpers must pass --wait, not -w --no-wait.
+
+    -w is the global OMERO CLI --password flag, not a --wait shortcut, so
+    `-w --no-wait` gets parsed as `--password "--no-wait"` and the delete
+    subcommand silently runs with no wait behavior at all (fire-and-forget,
+    reporting success without confirming the delete actually completed).
+    """
+
+    root_commands: list[str] = []
+    user_commands: list[str] = []
+
+    def fake_run_as_root(command: str) -> subprocess.CompletedProcess[str]:
+        root_commands.append(command)
+        return subprocess.CompletedProcess(
+            args=command, returncode=0, stdout="ok", stderr=""
+        )
+
+    def fake_run_in_omero(command: str) -> subprocess.CompletedProcess[str]:
+        user_commands.append(command)
+        return subprocess.CompletedProcess(
+            args=command, returncode=0, stdout="ok", stderr=""
+        )
+
+    monkeypatch.setattr(import_scan, "run_as_root", fake_run_as_root)
+    monkeypatch.setattr(import_scan, "run_in_omero", fake_run_in_omero)
+
+    import_scan.delete_project(101)
+    import_scan.delete_dataset_as_root(202)
+    import_scan.delete_image("habomero", "pw", "lab", 303)
+    import_scan.delete_dataset(
+        "habomero", "pw", "lab", "root_a", "some/dir", 404, {"root_a|some/dir": 404}
+    )
+
+    expected_delete_call_count = 4
+    all_commands = root_commands + user_commands
+    assert len(all_commands) == expected_delete_call_count
+    for command in all_commands:
+        delete_call = command.rsplit(";", 1)[-1].strip()
+        assert delete_call.startswith(("delete ", "omero delete "))
+        assert "--wait -1" in delete_call
+        assert "--no-wait" not in delete_call
+        assert " -w " not in delete_call
+        assert not delete_call.endswith(" -w")
+
+
 def test_import_config_loads_explicit_omero_delete_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
