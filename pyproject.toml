@@ -20,7 +20,7 @@ dependencies = [ "pyyaml>=6.0.3" ]
 [dependency-groups]
 dev = [
   "poethepoet>=0.48",
-  "pre-commit>=4.2",
+  "pre-commit>=4.6.1",
   "pytest>=9.1.1",
 ]
 docs = [
