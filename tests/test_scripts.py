@@ -327,6 +327,10 @@ def test_delete_missing_imports_removes_deleted_image_tracking(
         "load_dataset_image_ids_by_name",
         lambda *args: [123],
     )
+    # Dataset still has other images, so the now-empty-dataset cleanup no-ops.
+    monkeypatch.setattr(
+        import_scan, "load_dataset_image_names", lambda *args: {"other.tif"}
+    )
 
     def fake_delete_image(
         owner: str,
@@ -357,6 +361,69 @@ def test_delete_missing_imports_removes_deleted_image_tracking(
         other_key,
     }
     assert state_path.read_text(encoding="utf-8").splitlines() == sorted(imported)
+
+
+def test_delete_missing_imports_removes_now_empty_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataset left with zero images after cleanup is deleted too.
+
+    A non-empty sibling dataset (still holding other images) must be left alone.
+    """
+
+    state_path = tmp_path / "imported_files.txt"
+    empties_key = import_scan.imported_file_key(
+        "root_a", "habomero", "lab", "/scan/roots/root_a/dirA/missing1.tif"
+    )
+    stays_key = import_scan.imported_file_key(
+        "root_a", "habomero", "lab", "/scan/roots/root_a/dirB/missing2.tif"
+    )
+    imported = {empties_key, stays_key}
+    dataset_state = {
+        "root_a|owner=habomero|group=lab|dirA": 501,
+        "root_a|owner=habomero|group=lab|dirB": 502,
+    }
+    remaining_images_by_dataset = {501: set(), 502: {"other.tif"}}
+    deleted_dataset_ids: list[int] = []
+
+    monkeypatch.setattr(import_scan, "IMPORT_STATE_PATH", state_path)
+    monkeypatch.setattr(
+        import_scan,
+        "load_dataset_image_ids_by_name",
+        lambda *args: [111],
+    )
+    monkeypatch.setattr(import_scan, "delete_image", lambda *args: True)
+    monkeypatch.setattr(
+        import_scan,
+        "load_dataset_image_names",
+        lambda owner, password, group, dataset_id: remaining_images_by_dataset[
+            dataset_id
+        ],
+    )
+
+    def fake_delete_dataset_as_root(dataset_id: int) -> bool:
+        deleted_dataset_ids.append(dataset_id)
+        return True
+
+    monkeypatch.setattr(
+        import_scan, "delete_dataset_as_root", fake_delete_dataset_as_root
+    )
+
+    import_scan.delete_missing_imports(
+        "habomero",
+        "habomero",
+        "lab",
+        "root_a",
+        "/scan/roots/root_a",
+        set(),
+        imported,
+        dataset_state,
+    )
+
+    surviving_dataset_id = 502
+    assert deleted_dataset_ids == [501]
+    assert "root_a|owner=habomero|group=lab|dirA" not in dataset_state
+    assert dataset_state["root_a|owner=habomero|group=lab|dirB"] == surviving_dataset_id
 
 
 def test_delete_calls_use_wait_flag_not_broken_password_flag(

@@ -1125,6 +1125,7 @@ def delete_missing_imports(  # noqa: PLR0913
         return 0
 
     print(f"[cleanup] stale tracked files={len(stale_tracking_keys)} for {root_key}")
+    affected_datasets: dict[int, str] = {}
     for tracking_key in stale_tracking_keys:
         abs_path = tracking_key.removeprefix(root_prefix)
         rel_path = rel_path_from_root(abs_path, container_root)
@@ -1162,9 +1163,40 @@ def delete_missing_imports(  # noqa: PLR0913
         if deleted_all:
             imported.remove(tracking_key)
             deleted += 1
+            affected_datasets[dataset_id] = rel_dir
     if deleted:
         save_string_set(IMPORT_STATE_PATH, imported)
+
+    delete_now_empty_datasets(
+        owner, owner_password, shared_group, root_key, affected_datasets, dataset_state
+    )
     return deleted
+
+
+def delete_now_empty_datasets(  # noqa: PLR0913
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    root_key: str,
+    affected_datasets: dict[int, str],
+    dataset_state: dict[str, int],
+) -> None:
+    """Delete Datasets left with zero images after missing-file cleanup."""
+
+    for dataset_id, rel_dir in sorted(affected_datasets.items()):
+        remaining = load_dataset_image_names(
+            owner, owner_password, shared_group, dataset_id
+        )
+        if remaining:
+            continue
+        if delete_dataset_as_root(dataset_id):
+            print(f"[cleanup-empty-dataset] Dataset:{dataset_id} ({rel_dir})")
+            dataset_state.pop(
+                f"{state_scope_key(root_key, owner, shared_group)}|{rel_dir}", None
+            )
+            dataset_state.pop(f"{root_key}|{rel_dir}", None)
+        else:
+            print(f"[cleanup-empty-dataset-failed] Dataset:{dataset_id} ({rel_dir})")
 
 
 def build_import_command(import_mode: str, dataset_id: int, abs_path: str) -> str:
