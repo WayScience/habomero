@@ -14,6 +14,7 @@ import struct
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 FILENAME_RE = re.compile(
     r"^(?P<computer>.+)_(?P<plate_id>\d+)_(?P<well>[A-H]\d{2})"
@@ -203,7 +204,7 @@ def generate_companion_xml(
     )
     tiffdata = "\n".join(
         f'      <TiffData IFD="0" FirstC="{c}" FirstZ="0" FirstT="0" PlaneCount="1">\n'
-        f'        <UUID FileName="{rel_path}">urn:uuid:{uuid.uuid4()}</UUID>\n'
+        f"        <UUID FileName={quoteattr(rel_path)}>urn:uuid:{uuid.uuid4()}</UUID>\n"
         f"      </TiffData>"
         for c, rel_path in enumerate(channel_relative_paths)
     )
@@ -211,7 +212,7 @@ def generate_companion_xml(
 <OME xmlns="{OME_NAMESPACE}"
      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
      xsi:schemaLocation="{OME_NAMESPACE} {OME_NAMESPACE}/ome.xsd">
-  <Image ID="Image:0" Name="{image_name}">
+  <Image ID="Image:0" Name={quoteattr(image_name)}>
     <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="{pixel_type}"
             SizeX="{size_x}" SizeY="{size_y}" SizeC="{size_c}" SizeZ="1" SizeT="1">
 {channels}

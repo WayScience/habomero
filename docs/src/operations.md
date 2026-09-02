@@ -31,14 +31,17 @@ uv run poe scan-dirs
 
 ## High-content-screening (Thermo CX7) plate import
 
-Files named `<computer>_<plateID>_<well><row><col>f<field>d<channel>` (for example
-`CARD-CelIns-CX7_260803130001_B02f00d0`) are recognized automatically — no config
-flag needed to opt a folder in. Each well's fields are numbered 1-25 in a
-center-out spiral across a 5x5 grid; channels for one field are merged into a
-single multi-channel `Image` (via a generated Bio-Formats companion file,
-imported the same `--transfer=ln_s` way as everything else — no pixel data is
-duplicated) and organized into a proper OMERO `Plate`/`Well`/`WellSample`
-structure, instead of one flat `Image` per file.
+Files named `<computer>_<plateID>_<well>f<field>d<channel>` (for example
+`CARD-CelIns-CX7_260803130001_B02f00d0`, where `<well>` is a single token like
+`B02`) are matched by filename automatically, but HCS routing only activates
+once `hcs_channels` is set on that root (see below) — without it, matching
+files fall through to the normal flat per-file import instead. Fields are
+tokens `f00` through `f24`, numbered 1-25 in a center-out spiral across a 5x5
+grid; channels for one field are merged into a single multi-channel `Image`
+(via a generated Bio-Formats companion file, imported the same
+`--transfer=ln_s` way as everything else — no pixel data is duplicated) and
+organized into a proper OMERO `Plate`/`Well`/`WellSample` structure, instead
+of one flat `Image` per file.
 
 To enable it for a scan root, set `hcs_channels` (the number of channel files
 per field — this varies by experiment, so there's no default) on that entry in

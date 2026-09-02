@@ -131,6 +131,33 @@ def test_scan_dirs_materializes_per_root_group(
     assert next(iter(mapping.values()))["group"] == "way_mckinsey_cardiac_fibrosis"
 
 
+def test_scan_dirs_rejects_bool_hcs_channels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YAML boolean (e.g. `yes`) must not silently pass as a channel count.
+
+    `bool` is a subclass of `int` in Python, so `isinstance(True, int)` is
+    True and `True <= 0` is False -- without an explicit bool check, a YAML
+    `hcs_channels: yes` would slip through as `str(True)` and only fail much
+    later, far from the actual config mistake.
+    """
+
+    project_root = tmp_path / "project"
+    source = project_root / "cardiac"
+    source.mkdir(parents=True)
+    config_path = project_root / "scan_dirs.yml"
+    config_path.write_text(
+        "scan_directories:\n  - path: cardiac\n    hcs_channels: yes\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(scan_dirs, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(scan_dirs, "CONFIG_PATH", config_path)
+
+    with pytest.raises(ValueError, match="positive integers"):
+        scan_dirs.load_scan_directory_entries()
+
+
 def test_scan_dirs_materializes_per_root_import_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1054,10 +1081,10 @@ def test_find_plate_id_by_name_parses_hql_table_output(
     """find_plate_id_by_name parses the real `|`-delimited HQL table format."""
 
     table_output = (
-        " # | Col1 | Col2                    \n"
-        "---+------+-------------------------\n"
-        " 0 | 11   | Other_Plate              \n"
-        " 1 | 12   | DMSO_Plate :: PLATE1     \n"
+        " # | Col1 | Col2                    | Col3   \n"
+        "---+------+-------------------------+--------\n"
+        " 0 | 11   | Other_Plate              | None   \n"
+        " 1 | 12   | DMSO_Plate :: PLATE1     | None   \n"
         "(2 rows)\n"
     )
     monkeypatch.setattr(
@@ -1068,10 +1095,43 @@ def test_find_plate_id_by_name_parses_hql_table_output(
 
     expected_plate_id = 12
     plate_id = import_scan.find_plate_id_by_name(
-        "habomero", "pw", "lab", "DMSO_Plate :: PLATE1"
+        "habomero",
+        "pw",
+        "lab",
+        "DMSO_Plate :: PLATE1",
+        "root_a|owner=habomero|group=lab|DMSO_Plate/PLATE1",
     )
 
     assert plate_id == expected_plate_id
+
+
+def test_find_plate_id_by_name_rejects_mismatched_root_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name match from a different root's scope key is not reused."""
+
+    other_scope = "root_b|owner=x|group=lab|DMSO_Plate/PLATE1"
+    table_output = (
+        " # | Col1 | Col2                    | Col3   \n"
+        "---+------+-------------------------+--------\n"
+        f" 0 | 12   | DMSO_Plate :: PLATE1     | {other_scope} \n"
+        "(1 rows)\n"
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    plate_id = import_scan.find_plate_id_by_name(
+        "habomero",
+        "pw",
+        "lab",
+        "DMSO_Plate :: PLATE1",
+        "root_a|owner=habomero|group=lab|DMSO_Plate/PLATE1",
+    )
+
+    assert plate_id is None
 
 
 def test_find_plate_id_by_name_returns_none_when_absent(
@@ -1079,14 +1139,16 @@ def test_find_plate_id_by_name_returns_none_when_absent(
 ) -> None:
     """A name with no matching Plate returns None rather than a false positive."""
 
-    table_output = " # | Col1 | Col2 \n---+------+-------\n(0 rows)\n"
+    table_output = " # | Col1 | Col2 | Col3 \n---+------+------+------\n(0 rows)\n"
     monkeypatch.setattr(
         import_scan,
         "run_as_user_with_retry",
         lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
     )
 
-    plate_id = import_scan.find_plate_id_by_name("habomero", "pw", "lab", "Nonexistent")
+    plate_id = import_scan.find_plate_id_by_name(
+        "habomero", "pw", "lab", "Nonexistent", "root_a|owner=habomero|group=lab|x"
+    )
 
     assert plate_id is None
 

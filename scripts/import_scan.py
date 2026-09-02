@@ -1081,14 +1081,21 @@ def get_or_create_plate(  # noqa: PLR0913
     # directly before assuming this plate doesn't exist yet. Plate has no
     # unique database constraint on name (unlike Well's row/column), so a
     # stale-cache duplicate here fails silently instead of raising, which is
-    # exactly how the Plate:7/Plate:12 duplicate happened.
-    existing_plate_id = find_plate_id_by_name(owner, password, group, name)
+    # exactly how the Plate:7/Plate:12 duplicate happened. The scope key is
+    # also stored in Plate.description so two different roots that happen to
+    # share the same rel_dir (and thus the same display name) can't reuse
+    # each other's Plate.
+    existing_plate_id = find_plate_id_by_name(owner, password, group, name, map_key)
     if existing_plate_id is not None:
         plate_state[map_key] = existing_plate_id
         return existing_plate_id
 
     created = run_as_user_with_retry(
-        owner, password, f"omero obj new Plate name={shlex.quote(name)}", group
+        owner,
+        password,
+        f"omero obj new Plate name={shlex.quote(name)} "
+        f"description={shlex.quote(map_key)}",
+        group,
     )
     if created.returncode != 0:
         raise RuntimeError(
@@ -1100,7 +1107,7 @@ def get_or_create_plate(  # noqa: PLR0913
 
 
 def find_plate_id_by_name(
-    owner: str, password: str, group: str, name: str
+    owner: str, password: str, group: str, name: str, map_key: str
 ) -> int | None:
     """Find an existing Plate by exact name (oldest match), or None if not found.
 
@@ -1109,9 +1116,17 @@ def find_plate_id_by_name(
     (the separator this pipeline uses for folder-path-derived names) as a
     malformed filter-parameter reference. `list_projects_by_name` works around
     the same issue the same way.
+
+    A name match alone isn't enough: two different scan roots whose rel_dir
+    happens to collide would produce the same display name and could
+    otherwise reuse each other's Plate. `get_or_create_plate` stores its
+    `map_key` (root + owner + group + rel_dir) in Plate.description at
+    creation time, so name matches are also checked against it -- unless the
+    candidate predates this and has no description at all, in which case it
+    falls back to the old name-only match for backward compatibility.
     """
 
-    query = "select p.id, p.name from Plate p order by p.id"
+    query = "select p.id, p.name, p.description from Plate p order by p.id"
     result = run_as_user_with_retry(
         owner, password, f"omero hql {shlex.quote(query)}", group
     )
@@ -1121,10 +1136,18 @@ def find_plate_id_by_name(
         if "|" not in line:
             continue
         cols = [col.strip() for col in line.split("|")]
-        if len(cols) < 3 or not cols[0].isdigit() or not cols[1].isdigit():  # noqa: PLR2004
+        if len(cols) < 4 or not cols[0].isdigit() or not cols[1].isdigit():  # noqa: PLR2004
             continue
-        if cols[2] == name:
-            return int(cols[1])
+        if cols[2] != name:
+            continue
+        description = cols[3]
+        if (
+            description
+            and description not in ("None", "null")
+            and description != map_key
+        ):
+            continue
+        return int(cols[1])
     return None
 
 

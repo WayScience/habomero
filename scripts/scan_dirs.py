@@ -60,7 +60,11 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
                     )
                 import_user = raw_import_user.strip()
             if raw_hcs_channels is not None:
-                if not isinstance(raw_hcs_channels, int) or raw_hcs_channels <= 0:
+                if (
+                    isinstance(raw_hcs_channels, bool)
+                    or not isinstance(raw_hcs_channels, int)
+                    or raw_hcs_channels <= 0
+                ):
                     raise ValueError(
                         "scan_directories hcs_channels entries must be "
                         "positive integers"
