@@ -29,6 +29,37 @@ Then apply and materialize paths:
 uv run poe scan-dirs
 ```
 
+## High-content-screening (Thermo CX7) plate import
+
+Files named `<computer>_<plateID>_<well><row><col>f<field>d<channel>` (for example
+`CARD-CelIns-CX7_260803130001_B02f00d0`) are recognized automatically — no config
+flag needed to opt a folder in. Each well's fields are numbered 1-25 in a
+center-out spiral across a 5x5 grid; channels for one field are merged into a
+single multi-channel `Image` (via a generated Bio-Formats companion file,
+imported the same `--transfer=ln_s` way as everything else — no pixel data is
+duplicated) and organized into a proper OMERO `Plate`/`Well`/`WellSample`
+structure, instead of one flat `Image` per file.
+
+To enable it for a scan root, set `hcs_channels` (the number of channel files
+per field — this varies by experiment, so there's no default) on that entry in
+`config/omero/scan_dirs.yml`:
+
+```yaml
+scan_directories:
+  - path: ~/mnt/bandicoot/some_cx7_data
+    group: some_group
+    hcs_channels: 5
+```
+
+A field is only imported once all `hcs_channels` files for it are present;
+an incomplete field is silently retried on the next scan. Set `hcs_enabled: false`
+on an entry to force-disable detection even if filenames would otherwise match.
+
+Already-imported flat data for a plate converges to the same Plate/Well structure
+automatically the first time this runs against it — no separate migration step —
+and the superseded flat `Image`s (and their `Dataset`, if it ends up empty) are
+deleted as each field is merged.
+
 ## Check health and logs
 
 ```bash
