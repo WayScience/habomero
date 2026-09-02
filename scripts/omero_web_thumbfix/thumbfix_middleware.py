@@ -23,15 +23,25 @@ fails for any reason falls straight through to OMERO.web's normal view, so
 this can only fix behavior, never break it further.
 """
 
+from __future__ import annotations
+
 import base64
+import contextlib
 import io
 import json
 import logging
 import os
 import re
 import threading
+from typing import TYPE_CHECKING
 
 from django.http import HttpResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from django.http import HttpRequest
+    from omero.gateway import BlitzGateway
 
 logger = logging.getLogger(__name__)
 
@@ -65,22 +75,22 @@ _OMERO_GROUP = os.environ.get("THUMBFIX_OMERO_GROUP")
 
 
 class ThumbnailFixMiddleware:
-    def __init__(self, get_response):
+    def __init__(self, get_response: Callable[[HttpRequest], HttpResponse]) -> None:
         self.get_response = get_response
         self._lock = threading.Lock()
-        self._conn = None
+        self._conn: BlitzGateway | None = None
         os.makedirs(_CACHE_DIR, exist_ok=True)
 
-    def __call__(self, request):
-        if not _OMERO_USER or not _OMERO_PASSWORD:
-            return self.get_response(request)
-
-        if request.method != "GET":
-            return self.get_response(request)
-
-        if not request.session.get("connector"):
-            # No active OMERO.web login -- let the normal view handle
-            # redirecting to the login page.
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        # No configured credentials, non-GET, or no active OMERO.web login
+        # (in which case the normal view should handle redirecting to the
+        # login page) -- pass straight through in all of these cases.
+        if (
+            not _OMERO_USER
+            or not _OMERO_PASSWORD
+            or request.method != "GET"
+            or not request.session.get("connector")
+        ):
             return self.get_response(request)
 
         single = _THUMB_RE.match(request.path)
@@ -101,7 +111,7 @@ class ThumbnailFixMiddleware:
 
         return self.get_response(request)
 
-    def _handle_batch(self, request, batch):
+    def _handle_batch(self, request: HttpRequest, batch: re.Match[str]) -> HttpResponse:
         try:
             w_arg = batch.group("w")
             size = int(w_arg) if w_arg else 96
@@ -134,7 +144,9 @@ class ThumbnailFixMiddleware:
             logger.exception("thumbfix: failed handling get_thumbnails batch")
             return self.get_response(request)
 
-    def _cached_or_generate(self, iid, target_w, target_h):
+    def _cached_or_generate(
+        self, iid: str, target_w: int, target_h: int
+    ) -> bytes | None:
         cache_path = os.path.join(_CACHE_DIR, f"{iid}_{target_w}x{target_h}.jpg")
         if os.path.exists(cache_path):
             try:
@@ -162,7 +174,7 @@ class ThumbnailFixMiddleware:
 
         return data
 
-    def _generate(self, iid, target_w, target_h):
+    def _generate(self, iid: str, target_w: int, target_h: int) -> bytes | None:
         from PIL import Image as PILImage
 
         conn = self._get_connection()
@@ -188,7 +200,7 @@ class ThumbnailFixMiddleware:
         im.convert("RGB").save(buf, format="JPEG", quality=87)
         return buf.getvalue()
 
-    def _get_connection(self):
+    def _get_connection(self) -> BlitzGateway | None:
         from omero.gateway import BlitzGateway
 
         with self._lock:
@@ -198,10 +210,8 @@ class ThumbnailFixMiddleware:
                         return self._conn
                 except Exception:
                     pass
-                try:
+                with contextlib.suppress(Exception):
                     self._conn.close()
-                except Exception:
-                    pass
                 self._conn = None
 
             conn = BlitzGateway(

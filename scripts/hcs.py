@@ -23,11 +23,31 @@ FILENAME_RE = re.compile(
 # Zero-based field index -> (row, col) in the 5x5 per-well grid, center-out spiral.
 # Field 1 (index 0, filename token f00) sits at the center (2, 2).
 FIELD_GRID: dict[int, tuple[int, int]] = {
-    0: (2, 2), 1: (2, 3), 2: (3, 3), 3: (3, 2), 4: (3, 1),
-    5: (2, 1), 6: (1, 1), 7: (1, 2), 8: (1, 3), 9: (1, 4),
-    10: (2, 4), 11: (3, 4), 12: (4, 4), 13: (4, 3), 14: (4, 2),
-    15: (4, 1), 16: (4, 0), 17: (3, 0), 18: (2, 0), 19: (1, 0),
-    20: (0, 0), 21: (0, 1), 22: (0, 2), 23: (0, 3), 24: (0, 4),
+    0: (2, 2),
+    1: (2, 3),
+    2: (3, 3),
+    3: (3, 2),
+    4: (3, 1),
+    5: (2, 1),
+    6: (1, 1),
+    7: (1, 2),
+    8: (1, 3),
+    9: (1, 4),
+    10: (2, 4),
+    11: (3, 4),
+    12: (4, 4),
+    13: (4, 3),
+    14: (4, 2),
+    15: (4, 1),
+    16: (4, 0),
+    17: (3, 0),
+    18: (2, 0),
+    19: (1, 0),
+    20: (0, 0),
+    21: (0, 1),
+    22: (0, 2),
+    23: (0, 3),
+    24: (0, 4),
 }
 
 OME_NAMESPACE = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
@@ -99,8 +119,10 @@ def read_tiff_geometry(path: Path) -> tuple[int, int, int, int]:
     return parse_tiff_geometry(path.read_bytes(), label=str(path))
 
 
-def parse_tiff_geometry(data: bytes, label: str = "<bytes>") -> tuple[int, int, int, int]:
-    """Parse (width, height, bits_per_sample, sample_format) from baseline TIFF bytes."""
+def parse_tiff_geometry(
+    data: bytes, label: str = "<bytes>"
+) -> tuple[int, int, int, int]:
+    """Parse (width, height, bits_per_sample, sample_format) from a baseline TIFF."""
 
     byteorder = data[:2]
     if byteorder not in (b"II", b"MM"):
@@ -111,7 +133,9 @@ def parse_tiff_geometry(data: bytes, label: str = "<bytes>") -> tuple[int, int, 
     tags: dict[int, tuple[int, int, int]] = {}
     for i in range(n_entries):
         entry_off = ifd_offset + 2 + i * 12
-        tag, typ, count, value_offset = struct.unpack_from(fmt + "HHII", data, entry_off)
+        tag, typ, count, value_offset = struct.unpack_from(
+            fmt + "HHII", data, entry_off
+        )
         tags[tag] = (typ, count, value_offset)
 
     def tag_val(tagnum: int, default: int) -> int:
@@ -121,12 +145,12 @@ def parse_tiff_geometry(data: bytes, label: str = "<bytes>") -> tuple[int, int, 
         size = _TIFF_TYPE_SIZES.get(typ, 4) * count
         raw = (
             struct.pack(fmt + "I", value_offset)[:size]
-            if size <= 4
+            if size <= 4  # noqa: PLR2004
             else data[value_offset : value_offset + size]
         )
-        if typ == 3:
+        if typ == 3:  # noqa: PLR2004
             return struct.unpack(fmt + "H", raw[:2])[0]
-        if typ == 4:
+        if typ == 4:  # noqa: PLR2004
             return struct.unpack(fmt + "I", raw[:4])[0]
         return default
 
@@ -142,7 +166,7 @@ def parse_tiff_geometry(data: bytes, label: str = "<bytes>") -> tuple[int, int, 
 def ome_pixel_type(bits_per_sample: int, sample_format: int) -> str:
     """Map TIFF BitsPerSample/SampleFormat to an OME-XML Pixels Type value."""
 
-    if sample_format == 3:
+    if sample_format == 3:  # noqa: PLR2004
         return "float" if bits_per_sample <= 32 else "double"  # noqa: PLR2004
     signed = sample_format == 2  # noqa: PLR2004
     prefix = "int" if signed else "uint"
@@ -174,7 +198,8 @@ def generate_companion_xml(
 
     size_c = len(channel_relative_paths)
     channels = "\n".join(
-        f'      <Channel ID="Channel:0:{c}" SamplesPerPixel="1"/>' for c in range(size_c)
+        f'      <Channel ID="Channel:0:{c}" SamplesPerPixel="1"/>'
+        for c in range(size_c)
     )
     tiffdata = "\n".join(
         f'      <TiffData IFD="0" FirstC="{c}" FirstZ="0" FirstT="0" PlaneCount="1">\n'
@@ -197,7 +222,9 @@ def generate_companion_xml(
 """
 
 
-def ensure_shadow_symlink(shadow_root: Path, root_key: str, plate_key: str, real_plate_dir: str) -> Path:
+def ensure_shadow_symlink(
+    shadow_root: Path, root_key: str, plate_key: str, real_plate_dir: str
+) -> Path:
     """Create (idempotently) a persistent symlink to a plate's real source directory.
 
     Returns the plate's shadow directory (containing the `source` symlink), which is
