@@ -32,12 +32,16 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
     for item in raw_dirs:
         group = ""
         import_user = ""
+        hcs_channels = ""
+        hcs_enabled = ""
         if isinstance(item, str):
             raw_path = item
         elif isinstance(item, dict):
             raw_path = item.get("path")
             raw_group = item.get("group")
             raw_import_user = item.get("import_user")
+            raw_hcs_channels = item.get("hcs_channels")
+            raw_hcs_enabled = item.get("hcs_enabled")
             if raw_group is not None:
                 if not isinstance(raw_group, str) or not raw_group.strip():
                     raise ValueError(
@@ -55,6 +59,23 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
                         "scan_directories import_user entries must be non-empty strings"
                     )
                 import_user = raw_import_user.strip()
+            if raw_hcs_channels is not None:
+                if (
+                    isinstance(raw_hcs_channels, bool)
+                    or not isinstance(raw_hcs_channels, int)
+                    or raw_hcs_channels <= 0
+                ):
+                    raise ValueError(
+                        "scan_directories hcs_channels entries must be "
+                        "positive integers"
+                    )
+                hcs_channels = str(raw_hcs_channels)
+            if raw_hcs_enabled is not None:
+                if not isinstance(raw_hcs_enabled, bool):
+                    raise ValueError(
+                        "scan_directories hcs_enabled entries must be booleans"
+                    )
+                hcs_enabled = str(raw_hcs_enabled)
         else:
             raise ValueError(
                 "scan_directories entries must be non-empty strings or mappings"
@@ -79,6 +100,10 @@ def load_scan_directory_entries() -> list[dict[str, str]]:  # noqa: C901, PLR091
             row["group"] = group
         if import_user:
             row["import_user"] = import_user
+        if hcs_channels:
+            row["hcs_channels"] = hcs_channels
+        if hcs_enabled:
+            row["hcs_enabled"] = hcs_enabled
         resolved.append(row)
 
     # De-duplicate and collapse nested paths so one file tree is scanned once.
@@ -125,10 +150,14 @@ def materialize_scan_roots(
             source = item
             group = ""
             import_user = ""
+            hcs_channels = ""
+            hcs_enabled = ""
         else:
             source = Path(item["path"])
             group = item.get("group", "")
             import_user = item.get("import_user", "")
+            hcs_channels = item.get("hcs_channels", "")
+            hcs_enabled = item.get("hcs_enabled", "")
         key = root_key(source)
         container_root = f"/scan/roots/{key}"
 
@@ -140,6 +169,10 @@ def materialize_scan_roots(
             mapping[key]["group"] = group
         if import_user:
             mapping[key]["import_user"] = import_user
+        if hcs_channels:
+            mapping[key]["hcs_channels"] = hcs_channels
+        if hcs_enabled:
+            mapping[key]["hcs_enabled"] = hcs_enabled
         volumes.append(f"{source}:{container_root}:ro")
 
     try:

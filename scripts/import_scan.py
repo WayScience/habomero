@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shlex
@@ -13,6 +14,11 @@ from pathlib import Path
 
 import yaml
 
+try:
+    from scripts import hcs
+except ImportError:  # running as `python scripts/import_scan.py`, not as a package
+    import hcs
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 USERS_CONFIG_PATH = PROJECT_ROOT / "config/omero/users.yml"
 SCAN_CONFIG_PATH = PROJECT_ROOT / "config/omero/scan_dirs.yml"
@@ -22,6 +28,13 @@ IMPORT_STATE_PATH = PROJECT_ROOT / "data/state/imported_files.txt"
 DATASET_STATE_PATH = PROJECT_ROOT / "data/state/path_datasets.yml"
 PROJECT_STATE_PATH = PROJECT_ROOT / "data/state/root_projects.yml"
 FAILURE_STATE_PATH = PROJECT_ROOT / "data/state/import_failures.yml"
+HCS_SHADOW_ROOT = PROJECT_ROOT / "data/omero/hcs_shadow"  # bind-mounted as /OMERO in
+# the omero-server container (see compose.yml) — this must live there, not under
+# data/state, because `omero import` needs to read the shadow symlink and companion
+# files from inside the container.
+HCS_FIELD_STATE_PATH = PROJECT_ROOT / "data/state/hcs_imported_fields.txt"
+HCS_PLATE_STATE_PATH = PROJECT_ROOT / "data/state/hcs_plates.yml"
+HCS_WELL_STATE_PATH = PROJECT_ROOT / "data/state/hcs_wells.yml"
 SUPPORTED_EXTENSIONS = {
     ".tif",
     ".tiff",
@@ -429,12 +442,18 @@ def load_scan_roots() -> dict[str, dict[str, str]]:
             container_root = value.get("container_root")
             group = value.get("group")
             import_user = value.get("import_user")
+            hcs_channels = value.get("hcs_channels")
+            hcs_enabled = value.get("hcs_enabled")
             if isinstance(source, str) and isinstance(container_root, str):
                 result[key] = {"source": source, "container_root": container_root}
                 if isinstance(group, str) and group.strip():
                     result[key]["group"] = group.strip()
                 if isinstance(import_user, str) and import_user.strip():
                     result[key]["import_user"] = import_user.strip()
+                if isinstance(hcs_channels, str) and hcs_channels.strip():
+                    result[key]["hcs_channels"] = hcs_channels.strip()
+                if isinstance(hcs_enabled, str) and hcs_enabled.strip():
+                    result[key]["hcs_enabled"] = hcs_enabled.strip()
     return result
 
 
@@ -508,6 +527,48 @@ def run_as_user_with_retry(
             return result
         stderr_lower = result.stderr.lower()
         if not is_transient_import_error(stderr_lower):
+            return result
+        time.sleep(RETRY_INTERVAL_SECONDS)
+    assert last is not None
+    return last
+
+
+def run_python_as_user(
+    username: str, password: str, group: str, script: str
+) -> subprocess.CompletedProcess[str]:
+    """Run a Python script inside the OMERO server container's client venv.
+
+    Used for the small set of operations (Well/WellSample creation) that need the
+    OMERO Python API rather than the `omero` CLI, because the CLI's generic `obj new`
+    command can't populate a required collection field (`Well.wellSamples`) at
+    creation time. The script is base64-encoded to avoid shell-quoting a multi-line
+    Python source string; connection details are passed via environment variables.
+    """
+
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    full = (
+        "set -euo pipefail; "
+        'export PATH="/opt/omero/server/venv3/bin:$PATH"; '
+        f"export HCS_OMERO_USER={shlex.quote(username)}; "
+        f"export HCS_OMERO_PASSWORD={shlex.quote(password)}; "
+        f"export HCS_OMERO_GROUP={shlex.quote(group)}; "
+        f"echo {shlex.quote(encoded)} | base64 -d | python3 -"
+    )
+    return run_in_omero(full)
+
+
+def run_python_as_user_with_retry(
+    username: str, password: str, group: str, script: str
+) -> subprocess.CompletedProcess[str]:
+    """Retry transient OMERO connection failures for embedded Python scripts."""
+
+    last: subprocess.CompletedProcess[str] | None = None
+    for _ in range(RETRY_ATTEMPTS):
+        result = run_python_as_user(username, password, group, script)
+        last = result
+        if result.returncode == 0:
+            return result
+        if not is_transient_import_error(f"{result.stderr}\n{result.stdout}".lower()):
             return result
         time.sleep(RETRY_INTERVAL_SECONDS)
     assert last is not None
@@ -1001,6 +1062,251 @@ def get_or_create_dataset(  # noqa: PLR0913
     return dataset_id, True
 
 
+def get_or_create_plate(  # noqa: PLR0913
+    owner: str,
+    password: str,
+    group: str,
+    root_key: str,
+    rel_dir: str,
+    plate_state: dict[str, int],
+) -> int:
+    """Get or create the OMERO Plate for one HCS plate folder (keyed like Dataset)."""
+
+    map_key = f"{state_scope_key(root_key, owner, group)}|{rel_dir}"
+    if map_key in plate_state:
+        return plate_state[map_key]
+
+    name = build_dataset_name(rel_dir)
+    # The cache may be stale (e.g. after an interrupted run) -- check OMERO
+    # directly before assuming this plate doesn't exist yet. Plate has no
+    # unique database constraint on name (unlike Well's row/column), so a
+    # stale-cache duplicate here fails silently instead of raising, which is
+    # exactly how the Plate:7/Plate:12 duplicate happened. The scope key is
+    # also stored in Plate.description so two different roots that happen to
+    # share the same rel_dir (and thus the same display name) can't reuse
+    # each other's Plate.
+    existing_plate_id = find_plate_id_by_name(owner, password, group, name, map_key)
+    if existing_plate_id is not None:
+        plate_state[map_key] = existing_plate_id
+        return existing_plate_id
+
+    created = run_as_user_with_retry(
+        owner,
+        password,
+        f"omero obj new Plate name={shlex.quote(name)} "
+        f"description={shlex.quote(map_key)}",
+        group,
+    )
+    if created.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create plate for {rel_dir}: {created.stderr.strip()}"
+        )
+    plate_id = extract_object_id(created.stdout, "Plate")
+    plate_state[map_key] = plate_id
+    return plate_id
+
+
+def find_plate_id_by_name(
+    owner: str, password: str, group: str, name: str, map_key: str
+) -> int | None:
+    """Find an existing Plate by exact name (oldest match), or None if not found.
+
+    Queries all Plates and filters in Python rather than embedding the name in
+    the HQL WHERE clause: OMERO's HQL parser misparses names containing "::"
+    (the separator this pipeline uses for folder-path-derived names) as a
+    malformed filter-parameter reference. `list_projects_by_name` works around
+    the same issue the same way.
+
+    A name match alone isn't enough: two different scan roots whose rel_dir
+    happens to collide would produce the same display name and could
+    otherwise reuse each other's Plate. `get_or_create_plate` stores its
+    `map_key` (root + owner + group + rel_dir) in Plate.description at
+    creation time, so name matches are also checked against it -- unless the
+    candidate predates this and has no description at all, in which case it
+    falls back to the old name-only match for backward compatibility.
+    """
+
+    query = "select p.id, p.name, p.description from Plate p order by p.id"
+    result = run_as_user_with_retry(
+        owner, password, f"omero hql {shlex.quote(query)}", group
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if "|" not in line:
+            continue
+        cols = [col.strip() for col in line.split("|")]
+        if len(cols) < 4 or not cols[0].isdigit() or not cols[1].isdigit():  # noqa: PLR2004
+            continue
+        if cols[2] != name:
+            continue
+        description = cols[3]
+        if (
+            description
+            and description not in ("None", "null")
+            and description != map_key
+        ):
+            continue
+        return int(cols[1])
+    return None
+
+
+_AUTO_CONTRAST_SCRIPT = """
+import os
+import numpy as np
+from omero.gateway import BlitzGateway
+
+conn = BlitzGateway(
+    os.environ["HCS_OMERO_USER"],
+    os.environ["HCS_OMERO_PASSWORD"],
+    host="localhost",
+    port=4064,
+    group=os.environ["HCS_OMERO_GROUP"],
+)
+conn.connect()
+try:
+    image = conn.getObject("Image", __IMAGE_ID__)
+    pixels = image.getPrimaryPixels()
+    re = conn.createRenderingEngine()
+    re.lookupPixels(pixels.getId())
+    if not re.lookupRenderingDef(pixels.getId()):
+        re.resetDefaultSettings(True)
+        re.lookupRenderingDef(pixels.getId())
+    re.load()
+    for c in range(image.getSizeC()):
+        plane = pixels.getPlane(0, c, 0)
+        lo = float(np.percentile(plane, 1.0))
+        hi = float(np.percentile(plane, 99.5))
+        if hi <= lo:
+            hi = lo + 1
+        re.setChannelWindow(c, lo, hi)
+    re.saveCurrentSettings()
+    print("CONTRAST_OK")
+    # Settle the Thumbnail metadata row as the owning user (habomero) now,
+    # while we have write permission on it. OMERO.web's default thumbnail
+    # request path (direct=False) updates this row's bookkeeping on first
+    # access; a non-owner group member (read-annotate permission) hitting
+    # that path first gets a SecurityViolation trying to update someone
+    # else's object, which OMERO.web silently turns into a blank thumbnail.
+    image.getThumbnail(size=(96,), direct=False)
+    print("THUMBNAIL_OK")
+finally:
+    conn.close()
+"""
+
+
+_WELL_SAMPLE_SCRIPT = """
+import os
+import omero.sys
+import omero.rtypes
+from omero.gateway import BlitzGateway
+from omero.model import PlateI, WellI, WellSampleI
+from omero.rtypes import rint
+
+conn = BlitzGateway(
+    os.environ["HCS_OMERO_USER"],
+    os.environ["HCS_OMERO_PASSWORD"],
+    host="localhost",
+    port=4064,
+    group=os.environ["HCS_OMERO_GROUP"],
+)
+conn.connect()
+try:
+    query = conn.getQueryService()
+    update = conn.getUpdateService()
+    image = conn.getObject("Image", __IMAGE_ID__)._obj
+
+    def find_well_by_id(well_id):
+        hql = (
+            "select w from Well w "
+            "left join fetch w.wellSamples ws left join fetch ws.image "
+            "where w.id = :id"
+        )
+        params = omero.sys.ParametersI()
+        params.addId(well_id)
+        return query.findByQuery(hql, params, conn.SERVICE_OPTS)
+
+    def find_well_by_position(plate_id, row, column):
+        hql = (
+            "select w from Well w "
+            "left join fetch w.wellSamples ws left join fetch ws.image "
+            "where w.plate.id = :plate_id and w.row = :row and w.column = :column"
+        )
+        params = omero.sys.ParametersI()
+        params.add("plate_id", omero.rtypes.rlong(plate_id))
+        params.add("row", omero.rtypes.rint(row))
+        params.add("column", omero.rtypes.rint(column))
+        return query.findByQuery(hql, params, conn.SERVICE_OPTS)
+
+    well_id = __WELL_ID__
+    well = find_well_by_id(well_id) if well_id else None
+    if well is None:
+        # The cache may be stale (e.g. after an interrupted run) -- check the DB
+        # directly before assuming this well doesn't exist yet, to avoid a
+        # unique-constraint violation on (plate, row, column).
+        well = find_well_by_position(__PLATE_ID__, __ROW__, __COLUMN__)
+    if well is None:
+        well = WellI()
+        well.plate = PlateI(__PLATE_ID__, False)
+        well.row = rint(__ROW__)
+        well.column = rint(__COLUMN__)
+
+    sample = WellSampleI()
+    sample.image = image
+    sample.well = well
+    well.addWellSample(sample)
+
+    saved = update.saveAndReturnObject(well, conn.SERVICE_OPTS)
+    samples = saved.copyWellSamples()
+    print("WELL_ID=" + str(saved.id.val))
+    print("WELL_SAMPLE_ID=" + str(samples[-1].id.val))
+finally:
+    conn.close()
+"""
+
+
+def get_or_create_well_and_add_sample(  # noqa: PLR0913
+    owner: str,
+    password: str,
+    group: str,
+    plate_id: int,
+    well: str,
+    image_id: int,
+    well_state: dict[str, int],
+) -> tuple[int, int]:
+    """Get or create the Well for a plate position and append a new WellSample.
+
+    Uses the OMERO Python API (via `run_python_as_user`) rather than `omero obj new`
+    because `Well.wellSamples` is a required, non-nullable collection at creation
+    time — the CLI's generic object-creation command can't populate it, so the first
+    WellSample must be created together with the Well in one save. Later fields for
+    the same well append to the already-loaded `wellSamples` collection and re-save.
+    """
+
+    map_key = f"{plate_id}|{well}"
+    well_id = well_state.get(map_key, 0)
+    script = (
+        _WELL_SAMPLE_SCRIPT.replace("__IMAGE_ID__", str(image_id))
+        .replace("__WELL_ID__", str(well_id))
+        .replace("__PLATE_ID__", str(plate_id))
+        .replace("__ROW__", str(hcs.well_row_index(well)))
+        .replace("__COLUMN__", str(hcs.well_column_index(well)))
+    )
+    result = run_python_as_user_with_retry(owner, password, group, script)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create/update Well for {well} in Plate:{plate_id}: "
+            f"{result.stderr.strip()}"
+        )
+    well_match = re.search(r"WELL_ID=(\d+)", result.stdout)
+    sample_match = re.search(r"WELL_SAMPLE_ID=(\d+)", result.stdout)
+    if not well_match or not sample_match:
+        raise RuntimeError(f"Could not parse Well/WellSample id from: {result.stdout}")
+    well_id = int(well_match.group(1))
+    well_state[map_key] = well_id
+    return well_id, int(sample_match.group(1))
+
+
 def delete_dataset(  # noqa: PLR0913
     owner: str,
     password: str,
@@ -1076,9 +1382,17 @@ def load_dataset_image_ids_by_name(
     if result.returncode != 0:
         return []
 
+    # `omero hql` renders results as a `|`-delimited table (` # | Col1 \n---+---\n
+    # 0 | 12345 \n(1 row)`), not bracket notation — parse it the same way
+    # parse_project_records/parse_dataset_records do.
     ids: list[int] = []
-    for match in re.finditer(r"\[(\d+)\]", result.stdout):
-        ids.append(int(match.group(1)))
+    for line in result.stdout.splitlines():
+        if "|" not in line:
+            continue
+        cols = [col.strip() for col in line.split("|")]
+        if len(cols) < 2 or not cols[0].isdigit() or not cols[1].isdigit():  # noqa: PLR2004
+            continue
+        ids.append(int(cols[1]))
     return ids
 
 
@@ -1326,6 +1640,354 @@ def summarize_import_error(error: str) -> str:
     return lines[0]
 
 
+@dataclass(frozen=True)
+class HcsFieldGroup:
+    """One (plate folder, well, field) group of channel files ready for HCS import."""
+
+    rel_dir: str
+    well: str
+    field: str
+    plate_id: str  # numeric plate ID parsed from the source filenames
+    channel_files: dict[int, str]  # channel index -> container-absolute path
+
+
+def strip_supported_extension(filename: str) -> str:
+    """Remove a recognized image extension from a filename, if present."""
+
+    lowered = filename.lower()
+    for ext in SUPPORTED_EXTENSIONS:
+        if lowered.endswith(ext):
+            return filename[: -len(ext)]
+    return filename
+
+
+def partition_hcs_candidates(
+    root_files: list[str], container_root: str, hcs_channels: int
+) -> tuple[list[HcsFieldGroup], list[str]]:
+    """Split scanned files into ready HCS field groups and everything else.
+
+    Files matching the Thermo CX7 naming pattern are grouped by (plate folder, well,
+    field). A group is returned once it has `hcs_channels` files; an incomplete group
+    is silently omitted from both return values (not flat-imported, not marked
+    processed) so it's naturally reconsidered on a later scan once complete. Files
+    that don't match the HCS pattern at all continue through the existing flat
+    per-file import path unchanged.
+    """
+
+    groups: dict[tuple[str, str, str], dict[int, str]] = {}
+    plate_ids: dict[tuple[str, str, str], str] = {}
+    flat_files: list[str] = []
+    for abs_path in root_files:
+        rel_path = rel_path_from_root(abs_path, container_root)
+        stem = strip_supported_extension(Path(rel_path).name)
+        info = hcs.parse_filename(stem)
+        if info is None:
+            flat_files.append(abs_path)
+            continue
+        rel_dir = dataset_key_for_rel_path(rel_path)
+        key = (rel_dir, info.well, info.field)
+        groups.setdefault(key, {})[info.channel] = abs_path
+        plate_ids[key] = info.plate_id
+
+    ready: list[HcsFieldGroup] = []
+    for (rel_dir, well, field), channel_files in groups.items():
+        if len(channel_files) >= hcs_channels:
+            ready.append(
+                HcsFieldGroup(
+                    rel_dir,
+                    well,
+                    field,
+                    plate_ids[(rel_dir, well, field)],
+                    channel_files,
+                )
+            )
+    return ready, flat_files
+
+
+def _shadow_container_path(host_path: Path) -> str:
+    """Translate a host-side path under HCS_SHADOW_ROOT to its container path."""
+
+    return f"/OMERO/hcs_shadow/{host_path.relative_to(HCS_SHADOW_ROOT).as_posix()}"
+
+
+def ensure_hcs_shadow_root_writable() -> None:
+    """Bootstrap HCS_SHADOW_ROOT with host-writable ownership, once.
+
+    `data/omero` is bind-mounted into the omero-server container and owned by its
+    internal service user, so the host-side process can't create directories under
+    it directly. This creates just the `hcs_shadow` subtree (not the rest of
+    `data/omero`, which is live OMERO-managed storage) with ownership fixed to the
+    current host user/group, via a throwaway container run — mirroring the same
+    pattern `scan_dirs.materialize_scan_roots` already uses for `data/state`.
+    """
+
+    if HCS_SHADOW_ROOT.exists():
+        return
+    uid = os.getuid()
+    gid = os.getgid()
+    fix = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "-v",
+            f"{HCS_SHADOW_ROOT.parent}:/data",
+            "postgres:16",
+            "sh",
+            "-lc",
+            f"mkdir -p /data/{HCS_SHADOW_ROOT.name} && "
+            f"chown -R {uid}:{gid} /data/{HCS_SHADOW_ROOT.name}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if fix.returncode != 0:
+        detail = fix.stderr.strip() or fix.stdout.strip() or "auto-fix failed"
+        raise PermissionError(
+            f"Cannot create {HCS_SHADOW_ROOT} (owned by the OMERO container). "
+            f"Auto-fix failed: {detail}. "
+            f"Fix manually with: sudo mkdir -p {HCS_SHADOW_ROOT} && "
+            f"sudo chown -R {uid}:{gid} {HCS_SHADOW_ROOT}"
+        ) from None
+
+
+def read_container_file_bytes(container_path: str) -> bytes:
+    """Read a file's raw bytes from inside the OMERO server container.
+
+    Used instead of reading source files directly from the host filesystem: this
+    CIFS-backed mount has been observed to deny direct host-process reads of
+    individual files (even though `find`-based scanning and container-side reads of
+    the same files work fine) — an environment quirk, not something worth working
+    around by touching host-side file permissions.
+    """
+
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "omero-server", "cat", container_path],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read {container_path} from omero-server container: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    return result.stdout
+
+
+def import_hcs_field(  # noqa: PLR0913
+    owner: str,
+    password: str,
+    group: str,
+    root_key: str,
+    container_root: str,
+    group_info: HcsFieldGroup,
+) -> int:
+    """Build a companion file for one field's channels and import it as one Image.
+
+    Returns the new multi-channel Image id. Uses `--transfer=ln_s` throughout, same
+    as the rest of this pipeline — no pixel data is copied.
+    """
+
+    real_plate_dir = f"{container_root}/{group_info.rel_dir}"
+    ensure_hcs_shadow_root_writable()
+    plate_dir = hcs.ensure_shadow_symlink(
+        HCS_SHADOW_ROOT, root_key, group_info.rel_dir, real_plate_dir
+    )
+
+    ordered_channels = sorted(group_info.channel_files)
+    reference_container_path = group_info.channel_files[ordered_channels[0]]
+    reference_bytes = read_container_file_bytes(reference_container_path)
+    width, height, bits_per_sample, sample_format = hcs.parse_tiff_geometry(
+        reference_bytes, label=reference_container_path
+    )
+    pixel_type = hcs.ome_pixel_type(bits_per_sample, sample_format)
+
+    relative_paths = [
+        f"source/{Path(group_info.channel_files[c]).name}" for c in ordered_channels
+    ]
+    image_name = f"{group_info.plate_id}_{group_info.well}_{group_info.field}"
+    xml_text = hcs.generate_companion_xml(
+        image_name, width, height, pixel_type, relative_paths
+    )
+    # Must live alongside `source` (not in a subdirectory): companion FileName
+    # references are resolved relative to the companion file's own directory, and
+    # `..` parent-traversal in that path breaks checksum verification (see
+    # hcs.generate_companion_xml docstring).
+    companion_path = plate_dir / f"{group_info.well}_{group_info.field}.companion.ome"
+    companion_path.write_text(xml_text, encoding="utf-8")
+
+    companion_container_path = shlex.quote(_shadow_container_path(companion_path))
+    command = f"omero import --transfer=ln_s {companion_container_path}"
+    result = run_as_user_with_retry(owner, password, command, group)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to import HCS field {image_name}: {result.stderr.strip()}"
+        )
+    image_id = extract_object_id(result.stdout, "Image")
+
+    # Bio-Formats' OME-TIFF companion reader names the Image after the companion
+    # file itself, ignoring the <Image Name="..."> attribute — rename it after
+    # import so it reads as "B02_f00" rather than "B02_f00.companion.ome".
+    rename = run_as_user_with_retry(
+        owner, password, f"omero obj update Image:{image_id} name={image_name}", group
+    )
+    if rename.returncode != 0:
+        print(f"[hcs-rename-failed] Image:{image_id}: {rename.stderr.strip()}")
+
+    contrast_script = _AUTO_CONTRAST_SCRIPT.replace("__IMAGE_ID__", str(image_id))
+    contrast = run_python_as_user_with_retry(owner, password, group, contrast_script)
+    if contrast.returncode != 0:
+        print(f"[hcs-contrast-failed] Image:{image_id}: {contrast.stderr.strip()}")
+
+    return image_id
+
+
+def hcs_field_state_key(  # noqa: PLR0913
+    root_key: str, owner: str, group: str, rel_dir: str, well: str, field: str
+) -> str:
+    """Build the tracking key for one imported HCS field (well+field within a plate)."""
+
+    return f"{state_scope_key(root_key, owner, group)}|{rel_dir}:{well}:{field}"
+
+
+def cleanup_old_flat_field_images(  # noqa: PLR0913
+    owner: str,
+    password: str,
+    group: str,
+    root_key: str,
+    rel_dir: str,
+    channel_files: dict[int, str],
+    imported: set[str],
+    dataset_state: dict[str, int],
+) -> None:
+    """Delete pre-existing flat single-channel Images now superseded by an HCS Image.
+
+    Looks up the flat Dataset for this exact plate folder (read-only — does not
+    create one) and removes any old per-channel Images plus their tracking entries,
+    so already-imported plates converge to the same Plate/Well structure as new
+    data. If the flat Dataset ends up empty, `delete_now_empty_datasets` catches it.
+    """
+
+    dataset_id = dataset_state.get(
+        f"{state_scope_key(root_key, owner, group)}|{rel_dir}"
+    )
+    if dataset_id is None:
+        return
+
+    affected_datasets: dict[int, str] = {}
+    for abs_path in channel_files.values():
+        filename = Path(abs_path).name
+        image_ids = load_dataset_image_ids_by_name(
+            owner, password, group, dataset_id, filename
+        )
+        for image_id in image_ids:
+            if delete_image(owner, password, group, image_id):
+                print(f"[hcs-old-flat-cleanup] {filename} -> Image:{image_id}")
+                affected_datasets[dataset_id] = rel_dir
+            else:
+                print(f"[hcs-old-flat-cleanup-failed] {filename} -> Image:{image_id}")
+        tracking_key = imported_file_key(root_key, owner, group, abs_path)
+        imported.discard(tracking_key)
+
+    delete_now_empty_datasets(
+        owner, password, group, root_key, affected_datasets, dataset_state
+    )
+
+
+def process_hcs_candidates(  # noqa: PLR0913
+    owner: str,
+    owner_password: str,
+    shared_group: str,
+    root_key: str,
+    container_root: str,
+    hcs_channels: int,
+    root_files: list[str],
+    imported: set[str],
+    dataset_state: dict[str, int],
+    hcs_imported: set[str],
+    hcs_plate_state: dict[str, int],
+    hcs_well_state: dict[str, int],
+) -> list[str]:
+    """Import HCS-pattern fields as Plate/Well structure; return the remaining files.
+
+    Ready (well, field) groups are imported as one multi-channel Image each and
+    linked into Plate/Well/WellSample structure; any pre-existing flat
+    single-channel Images for the same files are deleted so already-imported plates
+    converge to the same structure as new data. Files that don't match the Thermo
+    CX7 naming pattern, and incomplete HCS groups (waiting on more channels), pass
+    through unchanged for the existing flat per-file import path.
+    """
+
+    if hcs_channels <= 0:
+        return root_files
+
+    ready_groups, flat_files = partition_hcs_candidates(
+        root_files, container_root, hcs_channels
+    )
+    for group_info in ready_groups:
+        field_key = hcs_field_state_key(
+            root_key,
+            owner,
+            shared_group,
+            group_info.rel_dir,
+            group_info.well,
+            group_info.field,
+        )
+        if field_key in hcs_imported:
+            continue
+        plate_id = get_or_create_plate(
+            owner,
+            owner_password,
+            shared_group,
+            root_key,
+            group_info.rel_dir,
+            hcs_plate_state,
+        )
+        image_id = import_hcs_field(
+            owner,
+            owner_password,
+            shared_group,
+            root_key,
+            container_root,
+            group_info,
+        )
+        get_or_create_well_and_add_sample(
+            owner,
+            owner_password,
+            shared_group,
+            plate_id,
+            group_info.well,
+            image_id,
+            hcs_well_state,
+        )
+        hcs_imported.add(field_key)
+        # Checkpoint after every field (not just per-root, like dataset/project
+        # state): an interrupted run must not lose track of a Plate/Well already
+        # created in OMERO, or the next run will hit a unique-constraint violation
+        # trying to recreate it.
+        save_string_set(HCS_FIELD_STATE_PATH, hcs_imported)
+        save_int_map(HCS_PLATE_STATE_PATH, hcs_plate_state)
+        save_int_map(HCS_WELL_STATE_PATH, hcs_well_state)
+        print(
+            f"[hcs-import] {group_info.rel_dir} {group_info.well}{group_info.field} "
+            f"-> Plate:{plate_id} Image:{image_id}"
+        )
+        cleanup_old_flat_field_images(
+            owner,
+            owner_password,
+            shared_group,
+            root_key,
+            group_info.rel_dir,
+            group_info.channel_files,
+            imported,
+            dataset_state,
+        )
+    return flat_files
+
+
 def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     owner: str,
     owner_password: str,
@@ -1334,6 +1996,10 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     root_key: str,
     source_root: str,
     container_root: str,
+    hcs_channels: int,
+    hcs_imported: set[str],
+    hcs_plate_state: dict[str, int],
+    hcs_well_state: dict[str, int],
     project_id: int,
     imported: set[str],
     dataset_state: dict[str, int],
@@ -1388,6 +2054,20 @@ def import_root_files(  # noqa: PLR0913, C901, PLR0912, PLR0915
     print(
         f"[root] {source_root}: candidate files={len(root_files)} "
         f"budget={budget_remaining if budget_capped else 'uncapped'}"
+    )
+    root_files = process_hcs_candidates(
+        owner,
+        owner_password,
+        shared_group,
+        root_key,
+        container_root,
+        hcs_channels,
+        root_files,
+        imported,
+        dataset_state,
+        hcs_imported,
+        hcs_plate_state,
+        hcs_well_state,
     )
     root_file_set = set(root_files)
     if delete_omero_missing_files:
@@ -1627,6 +2307,9 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
     imported_before = len(imported)
     dataset_state = load_int_map(DATASET_STATE_PATH)
     project_state = load_int_map(PROJECT_STATE_PATH)
+    hcs_imported = load_string_set(HCS_FIELD_STATE_PATH)
+    hcs_plate_state = load_int_map(HCS_PLATE_STATE_PATH)
+    hcs_well_state = load_int_map(HCS_WELL_STATE_PATH)
 
     imported_count = 0
     failures: dict[str, str] = {}
@@ -1644,6 +2327,14 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
             container_root = root_data["container_root"]
             root_group = root_data.get("group", shared_group)
             owner = root_data.get("import_user", default_import_user)
+            hcs_enabled = (
+                root_data.get("hcs_enabled", "true").strip().lower() != "false"
+            )
+            hcs_channels = (
+                int(root_data["hcs_channels"])
+                if hcs_enabled and root_data.get("hcs_channels")
+                else 0
+            )
             if owner not in credentials:
                 raise ImportConfigError(
                     f"Configured root import_user is not present in users.yml: {owner}"
@@ -1688,6 +2379,10 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
                 root_key,
                 source,
                 container_root,
+                hcs_channels,
+                hcs_imported,
+                hcs_plate_state,
+                hcs_well_state,
                 project_id,
                 imported,
                 dataset_state,
@@ -1743,6 +2438,8 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
             save_string_set(IMPORT_STATE_PATH, imported)
             save_int_map(DATASET_STATE_PATH, dataset_state)
             save_int_map(PROJECT_STATE_PATH, project_state)
+            save_int_map(HCS_PLATE_STATE_PATH, hcs_plate_state)
+            save_int_map(HCS_WELL_STATE_PATH, hcs_well_state)
             save_failure_map(FAILURE_STATE_PATH, failures)
             if hit_cap:
                 break
@@ -1753,6 +2450,8 @@ def import_files() -> None:  # noqa: C901, PLR0912, PLR0915
         save_string_set(IMPORT_STATE_PATH, imported)
         save_int_map(DATASET_STATE_PATH, dataset_state)
         save_int_map(PROJECT_STATE_PATH, project_state)
+        save_int_map(HCS_PLATE_STATE_PATH, hcs_plate_state)
+        save_int_map(HCS_WELL_STATE_PATH, hcs_well_state)
         save_failure_map(FAILURE_STATE_PATH, failures)
     imported_after = len(imported)
     print(

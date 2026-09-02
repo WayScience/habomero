@@ -55,7 +55,22 @@ services:
       # Keep web sessions after browser close unless explicitly disabled.
       CONFIG_omero_web_session_expire_at_browser_close:
         "${OMERO_WEB_SESSION_EXPIRE_AT_BROWSER_CLOSE:-false}"
+      # Workaround for a server-side bug where OMERO's native thumbnail
+      # generator returns solid-black previews for HCS Plate images (Pixels
+      # backed by a multi-file .companion.ome source). See
+      # scripts/omero_web_thumbfix/thumbfix_middleware.py for details.
+      # Registered via 02-thumbfix.omero (below), not a one-off `omero
+      # config append` -- omero-web's own startup runs "config drop
+      # default" and rebuilds omero.web.middleware from
+      # /opt/omero/web/config/*.omero on every restart, which would
+      # otherwise silently wipe a manually-set value.
+      PYTHONPATH: /opt/omero/web/extra
+      THUMBFIX_OMERO_USER: habomero
+      THUMBFIX_OMERO_PASSWORD: "${OMERO_USER_HABOMERO_PASSWORD}"
+      THUMBFIX_OMERO_GROUP: way_mckinsey_cardiac_fibrosis
     ports:
       - "${OMERO_WEB_PORT}:4080"
     volumes:
       - ./data/omero-web-var:/opt/omero/web/OMERO.web/var
+      - ./scripts/omero_web_thumbfix/thumbfix_middleware.py:/opt/omero/web/extra/thumbfix_middleware.py:ro
+      - ./scripts/omero_web_thumbfix/02-thumbfix.omero:/opt/omero/web/config/02-thumbfix.omero:ro

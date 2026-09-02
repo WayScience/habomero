@@ -4,6 +4,7 @@ scan_directories:
     group: cfret_subtyping_data
   - path: ~/mnt/Way_McKinsey_Cardiac_Fibrosis
     group: way_mckinsey_cardiac_fibrosis
+    hcs_channels: 5
 
 # Optional fallback OMERO group for scan roots that do not define a per-root
 # group. Users are not automatically joined to this group unless their users.yml

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import struct
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
 from scripts import (
+    hcs,
     import_scan,
     safe_restart,
     scan_dirs,
@@ -126,6 +129,33 @@ def test_scan_dirs_materializes_per_root_group(
         }
     ]
     assert next(iter(mapping.values()))["group"] == "way_mckinsey_cardiac_fibrosis"
+
+
+def test_scan_dirs_rejects_bool_hcs_channels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A YAML boolean (e.g. `yes`) must not silently pass as a channel count.
+
+    `bool` is a subclass of `int` in Python, so `isinstance(True, int)` is
+    True and `True <= 0` is False -- without an explicit bool check, a YAML
+    `hcs_channels: yes` would slip through as `str(True)` and only fail much
+    later, far from the actual config mistake.
+    """
+
+    project_root = tmp_path / "project"
+    source = project_root / "cardiac"
+    source.mkdir(parents=True)
+    config_path = project_root / "scan_dirs.yml"
+    config_path.write_text(
+        "scan_directories:\n  - path: cardiac\n    hcs_channels: yes\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(scan_dirs, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(scan_dirs, "CONFIG_PATH", config_path)
+
+    with pytest.raises(ValueError, match="positive integers"):
+        scan_dirs.load_scan_directory_entries()
 
 
 def test_scan_dirs_materializes_per_root_import_user(
@@ -914,3 +944,674 @@ def test_safe_restart_uses_root_helper_for_protected_locks(
 
     assert removed == [lock_path]
     assert protected == [lock_path]
+
+
+def test_load_dataset_image_ids_by_name_parses_hql_table_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`omero hql` renders a `|`-delimited table, not bracket notation.
+
+    Regression test: the previous `\\[(\\d+)\\]` regex never matched the CLI's real
+    output format and silently returned an empty list for every query.
+    """
+
+    table_output = " # | Col1  \n---+-------\n 0 | 55912 \n(1 row)\n"
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    ids = import_scan.load_dataset_image_ids_by_name(
+        "habomero", "pw", "lab", 10, "some_file.TIF"
+    )
+
+    assert ids == [55912]
+
+
+def test_load_dataset_image_ids_by_name_handles_multiple_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple matching rows all get parsed, not just the first."""
+
+    table_output = " # | Col1  \n---+-------\n 0 | 111 \n 1 | 222 \n(2 rows)\n"
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    ids = import_scan.load_dataset_image_ids_by_name(
+        "habomero", "pw", "lab", 10, "some_file.TIF"
+    )
+
+    assert ids == [111, 222]
+
+
+def test_load_dataset_image_ids_by_name_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-row result parses to an empty list, not an error."""
+
+    table_output = " # | Col1 \n---+------\n(0 rows)\n"
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    ids = import_scan.load_dataset_image_ids_by_name(
+        "habomero", "pw", "lab", 10, "some_file.TIF"
+    )
+
+    assert ids == []
+
+
+def test_get_or_create_plate_reuses_existing_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Plate already tracked in state is reused instead of recreated."""
+
+    commands: list[str] = []
+
+    def fake_run_as_user_with_retry(
+        owner: str, password: str, command: str, group: str
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "Plate:5", "")
+
+    monkeypatch.setattr(
+        import_scan, "run_as_user_with_retry", fake_run_as_user_with_retry
+    )
+    monkeypatch.setattr(import_scan, "find_plate_id_by_name", lambda *args: None)
+
+    expected_plate_id = 5
+    plate_state: dict[str, int] = {}
+    first = import_scan.get_or_create_plate(
+        "habomero", "pw", "lab", "root_a", "DMSO_Plate/PLATE1", plate_state
+    )
+    second = import_scan.get_or_create_plate(
+        "habomero", "pw", "lab", "root_a", "DMSO_Plate/PLATE1", plate_state
+    )
+
+    assert first == expected_plate_id
+    assert second == expected_plate_id
+    assert len(commands) == 1  # second call reused state, no new `omero obj new`
+
+
+def test_get_or_create_plate_self_heals_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty cache doesn't create a duplicate Plate if one already exists.
+
+    Regression test for the Plate:7/Plate:12 duplicate: an interrupted run can
+    lose plate_state before it's checkpointed, even though the Plate was already
+    created in OMERO. Unlike Well, Plate has no unique DB constraint to catch
+    this loudly, so the defensive lookup is the only thing preventing a silent
+    duplicate.
+    """
+
+    create_calls: list[str] = []
+
+    def fake_run_as_user_with_retry(
+        owner: str, password: str, command: str, group: str
+    ) -> subprocess.CompletedProcess[str]:
+        create_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "Plate:999", "")
+
+    monkeypatch.setattr(
+        import_scan, "run_as_user_with_retry", fake_run_as_user_with_retry
+    )
+    expected_plate_id = 42
+    monkeypatch.setattr(
+        import_scan, "find_plate_id_by_name", lambda *args: expected_plate_id
+    )
+
+    plate_id = import_scan.get_or_create_plate(
+        "habomero", "pw", "lab", "root_a", "DMSO_Plate/PLATE1", {}
+    )
+
+    assert plate_id == expected_plate_id
+    assert create_calls == []  # found via lookup, never called `omero obj new`
+
+
+def test_find_plate_id_by_name_parses_hql_table_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """find_plate_id_by_name parses the real `|`-delimited HQL table format."""
+
+    table_output = (
+        " # | Col1 | Col2                    | Col3   \n"
+        "---+------+-------------------------+--------\n"
+        " 0 | 11   | Other_Plate              | None   \n"
+        " 1 | 12   | DMSO_Plate :: PLATE1     | None   \n"
+        "(2 rows)\n"
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    expected_plate_id = 12
+    plate_id = import_scan.find_plate_id_by_name(
+        "habomero",
+        "pw",
+        "lab",
+        "DMSO_Plate :: PLATE1",
+        "root_a|owner=habomero|group=lab|DMSO_Plate/PLATE1",
+    )
+
+    assert plate_id == expected_plate_id
+
+
+def test_find_plate_id_by_name_rejects_mismatched_root_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name match from a different root's scope key is not reused."""
+
+    other_scope = "root_b|owner=x|group=lab|DMSO_Plate/PLATE1"
+    table_output = (
+        " # | Col1 | Col2                    | Col3   \n"
+        "---+------+-------------------------+--------\n"
+        f" 0 | 12   | DMSO_Plate :: PLATE1     | {other_scope} \n"
+        "(1 rows)\n"
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    plate_id = import_scan.find_plate_id_by_name(
+        "habomero",
+        "pw",
+        "lab",
+        "DMSO_Plate :: PLATE1",
+        "root_a|owner=habomero|group=lab|DMSO_Plate/PLATE1",
+    )
+
+    assert plate_id is None
+
+
+def test_find_plate_id_by_name_returns_none_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A name with no matching Plate returns None rather than a false positive."""
+
+    table_output = " # | Col1 | Col2 | Col3 \n---+------+------+------\n(0 rows)\n"
+    monkeypatch.setattr(
+        import_scan,
+        "run_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, table_output, ""),
+    )
+
+    plate_id = import_scan.find_plate_id_by_name(
+        "habomero", "pw", "lab", "Nonexistent", "root_a|owner=habomero|group=lab|x"
+    )
+
+    assert plate_id is None
+
+
+def test_get_or_create_well_and_add_sample_creates_then_appends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First call creates a Well+WellSample; second appends a sample to it."""
+
+    scripts_run: list[str] = []
+
+    def fake_run_python(
+        owner: str, password: str, group: str, script: str
+    ) -> subprocess.CompletedProcess[str]:
+        scripts_run.append(script)
+        if "well_id = 0" in script:
+            return subprocess.CompletedProcess(
+                script, 0, "WELL_ID=10\nWELL_SAMPLE_ID=100\n", ""
+            )
+        return subprocess.CompletedProcess(
+            script, 0, "WELL_ID=10\nWELL_SAMPLE_ID=101\n", ""
+        )
+
+    monkeypatch.setattr(import_scan, "run_python_as_user_with_retry", fake_run_python)
+
+    well_state: dict[str, int] = {}
+    well_id_1, sample_id_1 = import_scan.get_or_create_well_and_add_sample(
+        "habomero", "pw", "lab", 3, "B02", 111, well_state
+    )
+    well_id_2, sample_id_2 = import_scan.get_or_create_well_and_add_sample(
+        "habomero", "pw", "lab", 3, "B02", 112, well_state
+    )
+
+    assert (well_id_1, sample_id_1) == (10, 100)
+    assert (well_id_2, sample_id_2) == (10, 101)
+    assert well_state == {"3|B02": 10}
+    assert "well_id = 0" in scripts_run[0]
+    assert "well_id = 10" in scripts_run[1]
+    assert "PlateI(3, False)" in scripts_run[0]
+    assert "rint(1)" in scripts_run[0]  # row for 'B'
+
+
+def test_get_or_create_well_and_add_sample_raises_on_unparseable_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed script response surfaces as a clear error, not a silent bad state."""
+
+    monkeypatch.setattr(
+        import_scan,
+        "run_python_as_user_with_retry",
+        lambda *args: subprocess.CompletedProcess("", 0, "unexpected output", ""),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not parse Well/WellSample id"):
+        import_scan.get_or_create_well_and_add_sample(
+            "habomero", "pw", "lab", 3, "B02", 111, {}
+        )
+
+
+def test_hcs_parse_filename_matches_thermo_cx7_pattern() -> None:
+    """A well-formed Thermo CX7 filename stem parses into its components."""
+
+    info = hcs.parse_filename("CARD-CelIns-CX7_260803130001_B02f00d0")
+
+    assert info == hcs.HcsFileInfo(
+        computer="CARD-CelIns-CX7",
+        plate_id="260803130001",
+        well="B02",
+        field="f00",
+        channel=0,
+    )
+
+
+def test_hcs_parse_filename_rejects_non_matching_names() -> None:
+    """Filenames outside the Thermo CX7 convention are not treated as HCS data."""
+
+    assert hcs.parse_filename("CP_SPLAT_Cell_Density_2_061626") is None
+    assert hcs.parse_filename("CARD-CelIns-CX7_260803130001") is None
+    assert hcs.parse_filename("CARD-CelIns-CX7_260803130001_B02f00") is None
+
+
+def test_hcs_well_indices_are_zero_based() -> None:
+    """Well row/column indices follow the OME model's zero-based convention."""
+
+    last_row_index = 7  # 'H', the 8th row
+    last_column_index = 11  # '12', the 12th column
+
+    assert hcs.well_row_index("B02") == 1
+    assert hcs.well_row_index("A01") == 0
+    assert hcs.well_row_index("H12") == last_row_index
+    assert hcs.well_column_index("B02") == 1
+    assert hcs.well_column_index("A01") == 0
+    assert hcs.well_column_index("H12") == last_column_index
+
+
+def test_hcs_field_grid_matches_spiral_reference() -> None:
+    """Field grid positions match the user-supplied center-out spiral layout."""
+
+    expected_rows = [
+        ["f20", "f21", "f22", "f23", "f24"],
+        ["f19", "f06", "f07", "f08", "f09"],
+        ["f18", "f05", "f00", "f01", "f10"],
+        ["f17", "f04", "f03", "f02", "f11"],
+        ["f16", "f15", "f14", "f13", "f12"],
+    ]
+    for row_index, tokens in enumerate(expected_rows):
+        for col_index, token in enumerate(tokens):
+            assert hcs.field_grid_position(token) == (row_index, col_index)
+
+
+def test_hcs_field_grid_position_rejects_unknown_field() -> None:
+    """A field index outside the 25-field grid raises a clear error."""
+
+    with pytest.raises(hcs.HcsError, match="Unknown field index"):
+        hcs.field_grid_position("f25")
+
+
+def _write_minimal_tiff(
+    path: Path, width: int, height: int, bits_per_sample: int, sample_format: int | None
+) -> None:
+    """Write a minimal little-endian TIFF IFD header (no pixel data) for testing."""
+
+    tags = [(256, 3, width), (257, 3, height), (258, 3, bits_per_sample)]
+    if sample_format is not None:
+        tags.append((339, 3, sample_format))
+    ifd_offset = 8
+    header = struct.pack("<2sHI", b"II", 42, ifd_offset)
+    entry_count = struct.pack("<H", len(tags))
+    entries = b"".join(
+        struct.pack("<HHII", tag, typ, 1, value) for tag, typ, value in tags
+    )
+    next_ifd = struct.pack("<I", 0)
+    path.write_bytes(header + entry_count + entries + next_ifd)
+
+
+def test_hcs_read_tiff_geometry_parses_minimal_tiff(tmp_path: Path) -> None:
+    """TIFF geometry is read correctly from a minimal single-IFD TIFF."""
+
+    tiff_path = tmp_path / "test.tif"
+    _write_minimal_tiff(tiff_path, 1104, 1104, 16, sample_format=None)
+
+    width, height, bits_per_sample, sample_format = hcs.read_tiff_geometry(tiff_path)
+
+    assert (width, height, bits_per_sample) == (1104, 1104, 16)
+    assert sample_format == 1  # defaults to unsigned int when tag is absent
+
+
+def test_hcs_read_tiff_geometry_rejects_non_tiff(tmp_path: Path) -> None:
+    """A non-TIFF file is rejected with a clear error."""
+
+    bogus = tmp_path / "not_a_tiff.tif"
+    bogus.write_bytes(b"not a tiff file")
+
+    with pytest.raises(hcs.HcsError, match="Not a TIFF file"):
+        hcs.read_tiff_geometry(bogus)
+
+
+def test_hcs_ome_pixel_type_maps_common_cases() -> None:
+    """TIFF BitsPerSample/SampleFormat map to the correct OME Pixels Type."""
+
+    assert hcs.ome_pixel_type(16, sample_format=1) == "uint16"
+    assert hcs.ome_pixel_type(8, sample_format=1) == "uint8"
+    assert hcs.ome_pixel_type(16, sample_format=2) == "int16"
+    assert hcs.ome_pixel_type(32, sample_format=3) == "float"
+
+
+def test_hcs_ome_pixel_type_rejects_unsupported_bit_depth() -> None:
+    """An unsupported bit depth raises a clear error rather than silently mapping."""
+
+    with pytest.raises(hcs.HcsError, match="Unsupported bits-per-sample"):
+        hcs.ome_pixel_type(12, sample_format=1)
+
+
+def test_hcs_generate_companion_xml_structure() -> None:
+    """The companion XML declares the right channel count and file references."""
+
+    channel_count = 5
+    xml_text = hcs.generate_companion_xml(
+        image_name="B02_f00",
+        size_x=1104,
+        size_y=1104,
+        pixel_type="uint16",
+        channel_relative_paths=[f"source/ch{c}.TIF" for c in range(channel_count)],
+    )
+
+    root = ET.fromstring(xml_text)
+    ns = {"ome": hcs.OME_NAMESPACE}
+    pixels = root.find("ome:Image/ome:Pixels", ns)
+    assert pixels is not None
+    assert pixels.get("SizeC") == str(channel_count)
+    assert pixels.get("SizeX") == "1104"
+    assert pixels.get("Type") == "uint16"
+    channels = pixels.findall("ome:Channel", ns)
+    assert len(channels) == channel_count
+    tiffdata = pixels.findall("ome:TiffData", ns)
+    assert len(tiffdata) == channel_count
+    file_names = [
+        td.find("ome:UUID", ns).get("FileName")  # type: ignore[union-attr]
+        for td in tiffdata
+    ]
+    assert file_names == [f"source/ch{c}.TIF" for c in range(channel_count)]
+
+
+def test_hcs_generate_companion_xml_rejects_parent_traversal() -> None:
+    """Relative paths containing '..' are rejected before they can break checksums."""
+
+    with pytest.raises(hcs.HcsError, match=r"must not contain '\.\.'"):
+        hcs.generate_companion_xml(
+            image_name="B02_f00",
+            size_x=1104,
+            size_y=1104,
+            pixel_type="uint16",
+            channel_relative_paths=["../../scan/roots/root_a/ch0.TIF"],
+        )
+
+
+def test_hcs_ensure_shadow_symlink_is_idempotent(tmp_path: Path) -> None:
+    """A second call for the same plate reuses the symlink instead of recreating it."""
+
+    real_plate_dir = tmp_path / "real" / "plate1"
+    real_plate_dir.mkdir(parents=True)
+    shadow_root = tmp_path / "shadow"
+
+    first = hcs.ensure_shadow_symlink(
+        shadow_root, "root_a", "plate1", str(real_plate_dir)
+    )
+    second = hcs.ensure_shadow_symlink(
+        shadow_root, "root_a", "plate1", str(real_plate_dir)
+    )
+
+    assert first == second
+    assert (first / "source").resolve() == real_plate_dir.resolve()
+
+
+def test_hcs_ensure_shadow_symlink_rejects_conflicting_target(tmp_path: Path) -> None:
+    """A shadow symlink pointing elsewhere is a hard error, not silently rebound."""
+
+    real_a = tmp_path / "real_a"
+    real_a.mkdir()
+    real_b = tmp_path / "real_b"
+    real_b.mkdir()
+    shadow_root = tmp_path / "shadow"
+
+    hcs.ensure_shadow_symlink(shadow_root, "root_a", "plate1", str(real_a))
+
+    with pytest.raises(hcs.HcsError, match="already points elsewhere"):
+        hcs.ensure_shadow_symlink(shadow_root, "root_a", "plate1", str(real_b))
+
+
+def test_strip_supported_extension_removes_recognized_extensions() -> None:
+    """Only recognized image extensions are stripped, case-insensitively."""
+
+    assert import_scan.strip_supported_extension("foo.TIF") == "foo"
+    assert import_scan.strip_supported_extension("foo.tiff") == "foo"
+    assert import_scan.strip_supported_extension("foo.txt") == "foo.txt"
+
+
+def test_hcs_field_state_key_is_scoped_and_stable() -> None:
+    """The HCS field tracking key encodes root/owner/group/plate/well/field."""
+
+    key = import_scan.hcs_field_state_key(
+        "root_a", "habomero", "lab", "DMSO_Plate/PLATE1", "B02", "f00"
+    )
+
+    assert key == "root_a|owner=habomero|group=lab|DMSO_Plate/PLATE1:B02:f00"
+
+
+def test_partition_hcs_candidates_groups_ready_fields(tmp_path: Path) -> None:
+    """A complete channel set becomes a ready group; non-matching files pass through."""
+
+    container_root = "/scan/roots/root_a"
+    root_files = [
+        f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d0.TIF",
+        f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d1.TIF",
+        f"{container_root}/other_experiment/some_image.tif",
+    ]
+
+    ready, flat_files = import_scan.partition_hcs_candidates(
+        root_files, container_root, hcs_channels=2
+    )
+
+    assert len(ready) == 1
+    group = ready[0]
+    assert group.rel_dir == "Plate1"
+    assert group.well == "B02"
+    assert group.field == "f00"
+    assert group.plate_id == "260803130001"
+    assert group.channel_files == {
+        0: f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d0.TIF",
+        1: f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d1.TIF",
+    }
+    assert flat_files == [f"{container_root}/other_experiment/some_image.tif"]
+
+
+def test_partition_hcs_candidates_omits_incomplete_groups(tmp_path: Path) -> None:
+    """A field short of its configured channel count is skipped this cycle."""
+
+    container_root = "/scan/roots/root_a"
+    root_files = [
+        f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d0.TIF",
+    ]
+
+    ready, flat_files = import_scan.partition_hcs_candidates(
+        root_files, container_root, hcs_channels=5
+    )
+
+    assert ready == []
+    assert flat_files == []  # not flat-imported either; retried once complete
+
+
+def test_cleanup_old_flat_field_images_deletes_and_untracks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old flat images for a merged field are deleted and their tracking dropped."""
+
+    deleted_ids: list[int] = []
+    monkeypatch.setattr(
+        import_scan,
+        "load_dataset_image_ids_by_name",
+        lambda *args: [42],
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "delete_image",
+        lambda *args: deleted_ids.append(args[-1]) or True,
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "delete_now_empty_datasets",
+        lambda *args: None,
+    )
+
+    channel_files = {
+        0: "/scan/roots/root_a/Plate1/CARD-CelIns-CX7_260803130001_B02f00d0.TIF",
+        1: "/scan/roots/root_a/Plate1/CARD-CelIns-CX7_260803130001_B02f00d1.TIF",
+    }
+    imported = {
+        import_scan.imported_file_key("root_a", "habomero", "lab", channel_files[0]),
+        import_scan.imported_file_key("root_a", "habomero", "lab", channel_files[1]),
+        import_scan.imported_file_key("root_a", "habomero", "lab", "/keep.TIF"),
+    }
+    dataset_state = {"root_a|owner=habomero|group=lab|Plate1": 99}
+
+    import_scan.cleanup_old_flat_field_images(
+        "habomero",
+        "pw",
+        "lab",
+        "root_a",
+        "Plate1",
+        channel_files,
+        imported,
+        dataset_state,
+    )
+
+    assert deleted_ids == [42, 42]
+    assert imported == {
+        import_scan.imported_file_key("root_a", "habomero", "lab", "/keep.TIF")
+    }
+
+
+def test_process_hcs_candidates_orchestrates_plate_well_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ready field group creates a Plate/Well/Image, then old flat copies cleaned."""
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        import_scan, "HCS_FIELD_STATE_PATH", tmp_path / "hcs_fields.txt"
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "get_or_create_plate",
+        lambda *args: (calls.append("plate"), 7)[1],
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "import_hcs_field",
+        lambda *args: (calls.append("import"), 200)[1],
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "get_or_create_well_and_add_sample",
+        lambda *args: (calls.append("well"), (8, 80))[1],
+    )
+    monkeypatch.setattr(
+        import_scan,
+        "cleanup_old_flat_field_images",
+        lambda *args: calls.append("cleanup"),
+    )
+
+    container_root = "/scan/roots/root_a"
+    root_files = [
+        f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d0.TIF",
+        f"{container_root}/Plate1/CARD-CelIns-CX7_260803130001_B02f00d1.TIF",
+        f"{container_root}/other/plain_image.tif",
+    ]
+    imported: set[str] = set()
+    dataset_state: dict[str, int] = {}
+    hcs_imported: set[str] = set()
+    hcs_plate_state: dict[str, int] = {}
+    hcs_well_state: dict[str, int] = {}
+
+    remaining = import_scan.process_hcs_candidates(
+        "habomero",
+        "pw",
+        "lab",
+        "root_a",
+        container_root,
+        2,
+        root_files,
+        imported,
+        dataset_state,
+        hcs_imported,
+        hcs_plate_state,
+        hcs_well_state,
+    )
+
+    assert remaining == [f"{container_root}/other/plain_image.tif"]
+    assert calls == ["plate", "import", "well", "cleanup"]
+    assert hcs_imported == {
+        import_scan.hcs_field_state_key(
+            "root_a", "habomero", "lab", "Plate1", "B02", "f00"
+        )
+    }
+
+    # A second pass is a no-op for the already-processed field (idempotent).
+    calls.clear()
+    remaining_again = import_scan.process_hcs_candidates(
+        "habomero",
+        "pw",
+        "lab",
+        "root_a",
+        container_root,
+        2,
+        root_files,
+        imported,
+        dataset_state,
+        hcs_imported,
+        hcs_plate_state,
+        hcs_well_state,
+    )
+    assert calls == []
+    assert remaining_again == [f"{container_root}/other/plain_image.tif"]
+
+
+def test_process_hcs_candidates_disabled_returns_all_files_unchanged() -> None:
+    """hcs_channels <= 0 (HCS disabled for this root) is a complete pass-through."""
+
+    root_files = ["/scan/roots/root_a/anything.tif"]
+
+    remaining = import_scan.process_hcs_candidates(
+        "habomero",
+        "pw",
+        "lab",
+        "root_a",
+        "/scan/roots/root_a",
+        0,
+        root_files,
+        set(),
+        {},
+        set(),
+        {},
+        {},
+    )
+
+    assert remaining == root_files

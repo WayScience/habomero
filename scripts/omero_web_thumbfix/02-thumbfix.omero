@@ -1,0 +1,9 @@
+# Registers the thumbnail-fix middleware (thumbfix_middleware.py in this
+# same directory, bind-mounted to /opt/omero/web/extra on PYTHONPATH).
+# Runs after 01-default-webapps.omero, which rebuilds omero.web.middleware
+# from scratch after "config drop default" -- so this must append, not set,
+# and must be picked up by the same startup glob
+# (/opt/omero/web/config/*.omero) rather than run by hand, or it gets wiped
+# on every omero-web restart.
+
+config append -- omero.web.middleware '{"index": 7, "class": "thumbfix_middleware.ThumbnailFixMiddleware"}'
